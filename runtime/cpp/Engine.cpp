@@ -419,13 +419,13 @@ namespace K3 {
       shared_ptr<IOHandle> r;
       switch (m) {
         case IOMode::Read:
-          r = make_shared<FileHandle>(codec, make_shared<file_source>(path), StreamHandle::Input());
+          r = make_shared<FileHandle>(codec, file_source(path), StreamHandle::Input());
           break;
         case IOMode::Write:
-          r = make_shared<FileHandle>(codec, make_shared<file_sink>(path), StreamHandle::Output());
+          r = make_shared<FileHandle>(codec, file_sink(path), StreamHandle::Output());
           break;
         case IOMode::Append:
-          r = make_shared<FileHandle>(codec, make_shared<file_sink>(path, std::ios::app), StreamHandle::Output());
+          r = make_shared<FileHandle>(codec, file_sink(path, std::ios::app), StreamHandle::Output());
           break;
         case IOMode::ReadWrite:
           string errorMsg = "Unsupported open mode for file handle";
@@ -440,12 +440,12 @@ namespace K3 {
       shared_ptr<IOHandle> r;
       switch ( m ) {
         case IOMode::Read: {
-          shared_ptr<Net::NEndpoint> n_ep = shared_ptr<Net::NEndpoint>(new Net::NEndpoint(network_ctxt, addr));
+          auto n_ep = unique_ptr<Net::NEndpoint>(new Net::NEndpoint(network_ctxt, addr));
           r = make_shared<NetworkHandle>(NetworkHandle(codec, n_ep));
           break;
         }
         case IOMode::Write: {
-          shared_ptr<Net::NConnection> conn = shared_ptr<Net::NConnection>(new Net::NConnection(network_ctxt, addr));
+          auto conn = unique_ptr<Net::NConnection>(new Net::NConnection(network_ctxt, addr));
           r = make_shared<NetworkHandle>(NetworkHandle(codec, conn));
           break;
         }

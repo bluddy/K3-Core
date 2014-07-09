@@ -26,10 +26,10 @@ namespace K3
     virtual bool isInput() = 0;
     virtual bool isOutput() = 0;
     virtual bool hasRead() = 0;
-    virtual shared_ptr<Value> doRead() = 0;
+    virtual unique_ptr<Value> doRead() = 0;
 
     virtual bool hasWrite() = 0;
-    virtual void doWrite(shared_ptr<Value> v) = 0;
+    virtual void doWrite(const Value& v) = 0;
 
     virtual void close() = 0;
 
@@ -50,33 +50,30 @@ namespace K3
     IStreamHandle(shared_ptr<Codec> cdec, Source& src)
       : LogMT("IStreamHandle"), codec(cdec)
     {
-      input_ = shared_ptr<filtering_istream>(new filtering_istream());
-      input_->push(src);
+      input_.push(src);
     }
 
     bool hasRead() {
-      return input_?
-        ((input_->good() && codec->good()) || codec->decode_ready())
-        : false;
+        return (input_.good() && codec->good()) || codec->decode_ready();
     }
 
-    shared_ptr<string> doRead();
+    unique_ptr<string> doRead();
 
     bool hasWrite() {
       BOOST_LOG(*this) << "Invalid write operation on input handle";
       return false;
     }
 
-    void doWrite(shared_ptr<Value> data) {
+    void doWrite(const Value &data) {
       BOOST_LOG(*this) << "Invalid write operation on input handle";
     }
 
     // Invoke the destructor on the filtering_istream, which in
     // turn closes all associated iostream filters and devices.
-    void close() { if ( input_ ) { input_.reset(); } }
+    void close() { input_.reset(); }
 
   protected:
-    shared_ptr<filtering_istream> input_;
+    filtering_istream input_;
     shared_ptr<Codec> codec;
   };
 
@@ -87,8 +84,7 @@ namespace K3
     OStreamHandle(shared_ptr<Codec> cdec, Sink& sink)
       : LogMT("OStreamHandle"), codec(cdec)
     {
-      output = shared_ptr<filtering_ostream>(new filtering_ostream());
-      output->push(sink);
+      output.push(sink);
     }
 
     bool hasRead() {
@@ -96,85 +92,86 @@ namespace K3
       return false;
     }
 
-    shared_ptr<Value> doRead() {
+    unique_ptr<Value> doRead() {
       BOOST_LOG(*this) << "Invalid read operation on output handle";
-      return shared_ptr<Value>();
+      return unique_ptr<Value>();
     }
 
-    bool hasWrite() { return output? output->good() : false; }
+    bool hasWrite() { return output.good(); }
 
-    void doWrite(shared_ptr<Value> data ) { if ( output ) { (*output) << codec->encode(*data); } }
+    void doWrite(const Value& data ) { output << codec->encode(data); }
 
-    void close() { if ( output ) { output.reset(); } }
+    void close() { output.reset(); }
 
   protected:
-    shared_ptr<filtering_ostream> output;
+    filtering_ostream output;
     shared_ptr<Codec> codec;
   };
 
+  // TODO: refactor this so stream input/output inherit from this
   class StreamHandle : public IOHandle
   {
   public:
+    // TODO: change to enums
     struct Input  {};
     struct Output {};
 
     template<typename Source>
     StreamHandle(shared_ptr<Codec> cdec, Input i, Source& src)
-      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(true)
-    {
-      inImpl = shared_ptr<IStreamHandle>(new IStreamHandle(cdec, src));
-    }
+      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(true),
+        inImpl(unique_ptr<IStreamHandle>(new IStreamHandle(cdec, src)))
+    { }
 
     template<typename Sink>
     StreamHandle(shared_ptr<Codec>  cdec, Output o, Sink& sink)
-      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(false)
-    {
-      outImpl = shared_ptr<OStreamHandle>(new OStreamHandle(cdec, sink));
-    }
+      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(false),
+        outImpl(unique_ptr<OStreamHandle>(new OStreamHandle(cdec, sink)))
+    { }
 
-    bool isInput() { return isInput_; }
+    bool isInput()  { return isInput_; }
     bool isOutput() { return !isInput_; }
+
     // There are slightly bigger problems with the entire StreamHandle class
     // that makes it difficult to have one that does both input and output
 
     bool hasRead()  {
       bool r = false;
-      if ( inImpl ) { r = inImpl->hasRead(); }
+      if (inImpl) { r = inImpl->hasRead(); }
       else { BOOST_LOG(*this) << "Invalid hasRead on LineBasedHandle"; }
       return r;
     }
 
     bool hasWrite() {
       bool r = false;
-      if ( outImpl ) { r = outImpl->hasWrite(); }
+      if (outImpl) { r = outImpl->hasWrite(); }
       else { BOOST_LOG(*this) << "Invalid hasWrite on LineBasedHandle"; }
       return r;
     }
 
-    shared_ptr<Value> doRead() {
-      shared_ptr<Value> data;
-      if ( inImpl ) {
+    unique_ptr<Value> doRead() {
+      unique_ptr<Value> data;
+      if (inImpl) {
         data = inImpl->doRead();
       }
       else { BOOST_LOG(*this) << "Invalid doRead on LineBasedHandle"; }
       return data;
     }
 
-    void doWrite(shared_ptr<Value>  v) {
-      if ( outImpl) {
+    void doWrite(Value& v) {
+      if (outImpl) {
         outImpl->doWrite(v);
       }
       else { BOOST_LOG(*this) << "Invalid doWrite on LineBasedHandle"; }
     }
 
     void close() {
-      if ( inImpl ) { inImpl->close(); }
-      else if ( outImpl ) { outImpl->close(); }
+      if (inImpl) { inImpl->close(); }
+      else if (outImpl) { outImpl->close(); }
     }
 
   protected:
-    shared_ptr<IStreamHandle> inImpl;
-    shared_ptr<OStreamHandle> outImpl;
+    unique_ptr<IStreamHandle> inImpl;
+    unique_ptr<OStreamHandle> outImpl;
     bool isInput_;
   };
 
@@ -182,26 +179,27 @@ namespace K3
   class BuiltinHandle : public StreamHandle
   {
   public:
+    // TODO: change to enums
     struct Stdin  {};
     struct Stdout {};
     struct Stderr {};
 
     BuiltinHandle(shared_ptr<Codec> cdec, Stdin s)
-      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Input(), cin), isInput_(true)
+      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Input(), cin)
     {}
 
     BuiltinHandle(shared_ptr<Codec> cdec, Stdout s)
-      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Output(), cout), isInput_(false)
+      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Output(), cout)
     {}
 
     BuiltinHandle(shared_ptr<Codec> cdec, Stderr s)
-      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Output(), cerr), isInput_(false)
+      : LogMT("BuiltinHandle"), StreamHandle(cdec, StreamHandle::Output(), cerr)
     {}
 
-    bool isInput() { return isInput_; }
+    bool isInput()  { return isInput_; }
     bool isOutput() { return !isInput_; }
     bool builtin () { return true; }
-    bool file() { return false; }
+    bool file()     { return false; }
 
     IOHandle::SourceDetails networkSource()
     {
@@ -212,23 +210,21 @@ namespace K3
     {
       return make_tuple(shared_ptr<Codec>(), shared_ptr<Net::NConnection>());
     }
-  protected:
-    bool isInput_;
   };
 
   class FileHandle : public StreamHandle
   {
   public:
-    FileHandle(shared_ptr<Codec> cdec, shared_ptr<file_source> fs, StreamHandle::Input i)
-      :  StreamHandle(cdec, i, *fs), LogMT("FileHandle")
+    FileHandle(shared_ptr<Codec> cdec, const file_sink &fs, StreamHandle::Input i)
+      : StreamHandle(cdec, i, fs), LogMT("FileHandle")
     {}
 
-    FileHandle(shared_ptr<Codec> cdec, shared_ptr<file_sink> fs, StreamHandle::Output o)
-      :  LogMT("FileHandle"), StreamHandle(cdec, o, *fs)
+    FileHandle(shared_ptr<Codec> cdec, const file_sink &fs, StreamHandle::Output o)
+      : StreamHandle(cdec, o, fs), LogMT("FileHandle")
     {}
 
-    bool builtin () { return false; }
-    bool file() { return true; }
+    bool builtin()  { return false; }
+    bool file()     { return true; }
 
     IOHandle::SourceDetails networkSource()
     {
@@ -239,24 +235,21 @@ namespace K3
     {
       return make_tuple(shared_ptr<Codec>(), shared_ptr<Net::NConnection>());
     }
-
-  private:
-    shared_ptr<file_source> fileSrc;
-    shared_ptr<file_sink>   fileSink;
   };
 
+  // TODO: subclass into connection and endpoint
   class NetworkHandle : public IOHandle
   {
   public:
-    NetworkHandle(shared_ptr<Codec> cdec, shared_ptr<Net::NConnection> c)
-      : LogMT("NetworkHandle"), connection(c), IOHandle(cdec), isInput_(false)
+    NetworkHandle(shared_ptr<Codec> cdec, unique_ptr<Net::NConnection> c)
+      : LogMT("NetworkHandle"), connection(std::move(c)), IOHandle(cdec), isInput_(false)
     {}
 
-    NetworkHandle(shared_ptr<Codec> cdec, shared_ptr<Net::NEndpoint> e)
-      : LogMT("NetworkHandle"), endpoint(e), IOHandle(cdec), isInput_(false)
+    NetworkHandle(shared_ptr<Codec> cdec, unique_ptr<Net::NEndpoint> e)
+      : LogMT("NetworkHandle"), endpoint(std::move(e)), IOHandle(cdec), isInput_(false)
     {}
 
-    bool isInput() { return isInput_; }
+    bool isInput()  { return isInput_; }
     bool isOutput() { return !isInput_; }
     bool hasRead()  {
       BOOST_LOG(*this) << "Invalid hasRead on NetworkHandle";
@@ -265,29 +258,30 @@ namespace K3
 
     bool hasWrite() {
       bool r = false;
-      if ( connection ) {
+      if (connection) {
         r = connection->connected(); }
       else { BOOST_LOG(*this) << "Invalid hasWrite on NetworkHandle"; }
       return r;
     }
 
-    shared_ptr<Value> doRead() {
+    unique_ptr<Value> doRead() {
       BOOST_LOG(*this) << "Invalid doRead on NetworkHandle";
-      return shared_ptr<Value>();
+      return unique_ptr<Value>();
     }
 
-    void doWrite(shared_ptr<Value>  v) {
-      if ( connection && this->codec ) {
-        string data = this->codec->encode(*v);
-        shared_ptr<Value> s = make_shared<Value>(data);
-        connection->write(s);
+    void doWrite(Value&  v) {
+      if (connection && codec) {
+        auto data = codec->encode(v);
+        connection->write(data);
       }
-      else { BOOST_LOG(*this) << "Invalid doWrite on NetworkHandle"; }
+      else {
+        BOOST_LOG(*this) << "Invalid doWrite on NetworkHandle";
+      }
     }
 
     void close() {
-      if ( connection ) { connection->close(); }
-      else if ( endpoint ) { endpoint->close(); }
+      if (connection) { connection->close(); }
+      else if (endpoint) { endpoint->close(); }
     }
 
     bool builtin () { return false; }
@@ -295,21 +289,22 @@ namespace K3
 
     IOHandle::SourceDetails networkSource()
     {
-      shared_ptr<Codec> cdec = endpoint? this->codec : shared_ptr<Codec>();
+      shared_ptr<Codec> cdec = endpoint? codec : shared_ptr<Codec>();
       return make_tuple(cdec, endpoint);
     }
 
     IOHandle::SinkDetails networkSink()
     {
-      shared_ptr<Codec> cdec = connection? this->codec : shared_ptr<Codec>();
+      shared_ptr<Codec> cdec = connection? codec : shared_ptr<Codec>();
       return make_tuple(cdec, connection);
     }
 
   protected:
-    shared_ptr<Net::NConnection> connection;
-    shared_ptr<Net::NEndpoint> endpoint;
+    unique_ptr<Net::NConnection> connection;
+    unique_ptr<Net::NEndpoint>   endpoint;
     bool isInput_;
   };
-}
 
-#endif
+} // namespace K3
+
+#endif // K3_RUNTIME_IOHANDLE_HPP

@@ -15,7 +15,7 @@
 #include <nanomsg/pipeline.h>
 #include <nanomsg/tcp.h>
 
-#include <Common.hpp>
+#include "Common.hpp"
 
 class EndpointBuffer;
 
@@ -56,7 +56,7 @@ namespace K3
 
     virtual Socket socket() = 0;
     virtual void close() = 0;
-    virtual void write(shared_ptr<Value> ) = 0;
+    virtual void write(Value&) = 0;
 
     // TODO
     //virtual bool has_write() = 0;
@@ -154,54 +154,52 @@ namespace K3
 
       void close() { if ( socket_ ) { socket_->close(); } }
 
-      void write(shared_ptr<Value>  val) {
+      void write(Value& val) {
         // TODO switch to scoped locks
         // If the loop is already running, just add the message to the queue
         mut.lock();
         if (busy) {
-          while(buffer_->size() > 1000) {
+          while(buffer_.size() > 1000) {
             logAt(boost::log::trivial::trace, "Too many messages on outgoing queue: waiting...");
             mut.unlock();
       boost::this_thread::sleep_for( boost::chrono::seconds(1) );
             mut.lock();
           }
-          buffer_->push(val);
+          buffer_.push(make_shared<Value>(val));
         }
         // Otherwise, start the loop
         else {
           busy = true;
-          async_write_loop(val);
+          asyncWriteLoop(make_shared<Value>(val));
         }
         mut.unlock();
       }
 
-      void async_write_loop(shared_ptr<Value> val) {
+      // We can't use unique pointers as they can't be captured by lambdas
+      void asyncWriteLoop(const shared_ptr<Value> val) {
         size_t desired = val->length();
+
         // Write the value out to the socket
-        async_write(*socket_, boost::asio::buffer(*val,
-          desired),
-        [=](boost::system::error_code ec, size_t s)
+        async_write(*socket_, boost::asio::buffer(*val, desired),
+        [=, &val](const boost::system::error_code& ec, size_t bytes_transferred)
         {
-          // Capture the buffer in closure to keep its pointer count > 0
-          // until this callback has been executed
-          shared_ptr<Value> keep_alive = val;
           // Check for errors:
-          if (ec || (s != desired)) {
+          if (ec || (bytes_transferred != desired)) {
             BOOST_LOG(*(static_cast<LogMT*>(this))) << "Error on write: " << ec.message()
-              << " wrote  " << s << " out of " << desired << " bytes" << endl;
+              << " wrote  " << bytes_transferred << " out of " << desired << " bytes" << endl;
           }
 
           // Determine loop status:
           mut.lock();
           // If the buffer is empty, terminate the loop for now.
-          if (buffer_->empty()) {
+          if (buffer_.empty()) {
             busy = false;
           }
           // Otherwise, pop the next value and recurse
           else {
-            shared_ptr<Value> newval = buffer_->front();
-            buffer_->pop();
-            async_write_loop(newval);
+            shared_ptr<Value> newval = buffer_.front();
+            buffer_.pop();
+            asyncWriteLoop(newval);
           }
           mut.unlock();
         });
@@ -210,14 +208,13 @@ namespace K3
     protected:
       NConnection(shared_ptr<NContext> ctxt, Socket s)
         : ::K3::NConnection<NContext, Socket>("NConnection", ctxt, s),
-          LogMT("NConnection"), socket_(s), connected_(false), busy(false),
-          buffer_(new std::queue<shared_ptr<Value>>())
+          LogMT("NConnection"), socket_(s), connected_(false), busy(false)
       {}
       // use mutex to operate on queues and busy atomically
       boost::mutex mut;
-      bool busy;
-      shared_ptr<std::queue<shared_ptr<Value>>> buffer_;
+      std::queue<shared_ptr<Value>> buffer_;
       Socket socket_;
+      bool busy;
       bool connected_;
     };
   }
