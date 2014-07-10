@@ -6,29 +6,6 @@ using namespace boost;
 namespace K3
 {
 
-    bool ScalarEPBufferMT::push_back(shared_ptr<Value> v) {
-      strict_lock<LockB> guard(*this);
-      // Failure:
-      if (!v || (contents.get(guard))) {
-        return false;
-      }
-      // Success:
-      contents.get(guard) = v;
-      return true;
-    }
-
-    shared_ptr<Value> ScalarEPBufferMT::pop() {
-      strict_lock<LockB> guard(*this);
-      shared_ptr<Value> v;
-      if (contents.get(guard)) {
-        // Success:
-        v = contents.get(guard);
-        contents.get(guard).reset();
-      }
-      // In case of failure, v is a null pointer
-      return v;
-    }
-
     shared_ptr<Value> ScalarEPBufferMT::refresh(shared_ptr<IOHandle> ioh, NotifyFn notify)
     {
       strict_lock<LockB> guard(*this);
@@ -326,57 +303,70 @@ namespace K3
       handle_->close();
     };
 
-    void EndpointState::clearEndpoints(shared_ptr<ConcurrentEndpointMap> m) {
-      list<Identifier> endpoint_names;
-
-      strict_lock<EndpointState> guard(*this);
-
-      for (pair<Identifier, shared_ptr<Endpoint>> p: *(m->get(guard))) {
-        endpoint_names.push_back(p.first);
+    Endpoint* EndpointState::getInternalEndpoint(const Identifier &id) {
+      if (externalEndpointId(id)) {
+        epsLogger_->logAt(trivial::error, "Invalid request for internal endpoint: "+id);
+        return NULL;
       }
-
-      for (Identifier i: endpoint_names) {
-        removeEndpoint(i);
-      }
-
-      return;
+      return getEndpoint(id, internalEndpoints_);
     }
 
-    shared_ptr<Endpoint> EndpointState::getInternalEndpoint(Identifier id) {
-      if ( externalEndpointId(id) ) {
-        epsLogger->logAt(trivial::error, "Invalid request for internal endpoint: "+id);
-        return shared_ptr<Endpoint>();
+    Endpoint* EndpointState::getExternalEndpoint(const Identifier &id) {
+      if (!externalEndpointId(id)) {
+        epsLogger_->logAt(trivial::error, "Invalid request for external endpoint: "+id);
+        return NULL;
       }
-      return getEndpoint(id, internalEndpoints);
+      return getEndpoint(id, externalEndpoints_);
     }
-
-    shared_ptr<Endpoint> EndpointState::getExternalEndpoint(Identifier id) {
-      if ( !externalEndpointId(id) ) {
-        epsLogger->logAt(trivial::error, "Invalid request for external endpoint: "+id);
-        return shared_ptr<Endpoint>();
-      }
-      return getEndpoint(id, externalEndpoints);
+    
+    // TODO: allow direct access to endpoints (saving them) so we don't have to
+    // keep going through the map
+    Endpoint* EndpointState::getEndpoint(Identifier id, ConcurrentEndpointMap& epMap) {
+      boost::strict_lock<EndpointState> guard(*this);
+      auto it = epMap.get(guard).find(id);
+      if (it != epMap.get(guard).end()) return &(it->second); 
+      else return NULL;
     }
 
     size_t EndpointState::numEndpoints() {
       strict_lock<EndpointState> guard(*this);
-      return externalEndpoints->get(guard)->size() + internalEndpoints->get(guard)->size();
+      return externalEndpoints_.get(guard).size() + internalEndpoints_.get(guard).size();
     }
 
     void EndpointState::logEndpoints() {
       strict_lock<EndpointState> guard(*this);
-      BOOST_LOG(*epsLogger) << "Internal Endpoints (" << internalEndpoints->get(guard)->size() << ") @ " << internalEndpoints << ":";
-      for (const std::pair<Identifier, shared_ptr<Endpoint> >& something: *(internalEndpoints->get(guard)) )
+      BOOST_LOG(*epsLogger_) << "Internal Endpoints (" << internalEndpoints_.get(guard).size() << ") @ " << internalEndpoints_ << ":";
+      for (const std::pair<Identifier, Endpoint>& something: internalEndpoints_.get(guard) )
       {
-        BOOST_LOG(*epsLogger) << "\t" << something.first;
+        BOOST_LOG(*epsLogger_) << "\t" << something.first;
       }
 
-      BOOST_LOG(*epsLogger) << "External Endpoints (" << externalEndpoints->get(guard)->size() << ") @ " << externalEndpoints << ":";
-      for (const std::pair<Identifier, shared_ptr<Endpoint> >& something: *(externalEndpoints->get(guard)) )
+      BOOST_LOG(*epsLogger_) << "External Endpoints (" << externalEndpoints_.get(guard).size() << ") @ " << externalEndpoints_ << ":";
+      for (const std::pair<Identifier, Endpoint>& something: externalEndpoints_->get(guard) )
       {
-        BOOST_LOG(*epsLogger) << "\t" << something.first;
+        BOOST_LOG(*epsLogger_) << "\t" << something.first;
       }
     }
+
+    void EndpointState::addEndpoint(Identifier id, EndpointDetails details,
+                     ConcurrentEndpointMap& epMap)
+    {
+      boost::strict_lock<EndpointState> guard(*this);
+      auto lb = epMap.get(guard).lower_bound(id);
+
+      if (lb == epMap.get(guard).end() || id != lb.first)
+      {
+        shared_ptr<Endpoint> ep =
+          shared_ptr<Endpoint>(new Endpoint(get<0>(details), get<1>(details), get<2>(details)));
+
+        epMap.get(guard).insert(lb, make_pair(id, 
+          Endpoint(get<0>(details), get<1>(details), get<2>(details))));
+
+      } else {
+        BOOST_LOG(epsLogger_) << "Invalid attempt to add a duplicate endpoint for " << id;
+      }
+    }
+
 
     bool ConnectionState::ConnectionMap::addConnection(Address& addr, shared_ptr<Net::NConnection> c) {
       bool r = false;

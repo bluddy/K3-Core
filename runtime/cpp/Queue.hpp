@@ -364,20 +364,20 @@ namespace K3 {
   //--------------------
   // Queue constructors.
 
-  static inline shared_ptr<MessageQueues> simpleQueues(Address addr)
+  static inline unique_ptr<MessageQueues> simpleQueues(Address addr)
   {
-    return shared_ptr<MessageQueues>(new SinglePeerQueue(addr));
+    return unique_ptr<MessageQueues>(new SinglePeerQueue(addr));
   }
 
-  static inline shared_ptr<MessageQueues> perPeerQueues(const list<Address>& addresses)
+  static inline unique_ptr<MessageQueues> perPeerQueues(const list<Address>& addresses)
   {
-    return shared_ptr<MessageQueues>(new MultiPeerQueue(addresses));
+    return unique_ptr<MessageQueues>(new MultiPeerQueue(addresses));
   }
 
-  static inline shared_ptr<MessageQueues>
+  static inline unique_ptr<MessageQueues>
   perTriggerQueues(const list<Address>& addresses, const list<TriggerId>& triggerIds)
   {
-    return shared_ptr<MessageQueues>(new MultiTriggerQueue(addresses, triggerIds));
+    return unique_ptr<MessageQueues>(new MultiTriggerQueue(addresses, triggerIds));
   }
 }
 

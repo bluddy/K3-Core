@@ -31,29 +31,20 @@ namespace K3 {
 
   class EngineConfiguration {
   public:
-    EngineConfiguration() { defaultConfiguration(); }
-    EngineConfiguration(Address& addr) { configureWithAddress(addr); }
+    EngineConfiguration() : address_(defaultAddress),
+                            defaultBufferSpec_(BufferSpec(100,10),
+                            connectionRetries(100),
+                            waitForNetwork_(false) 
+                            {}
 
     Address    address()           { return address_; }
     BufferSpec defaultBufferSpec() { return defaultBufferSpec_; }
     int        connectionRetries() { return connectionRetries_; }
     bool       waitForNetwork()    { return waitForNetwork_; }
 
+    void       setAddress(Address a) { address_ = a; }
+
   protected:
-
-    void defaultConfiguration() {
-      address_           = defaultAddress;
-      defaultBufferSpec_ = BufferSpec(100,10);
-      connectionRetries_ = 100;
-      waitForNetwork_    = false;
-    }
-
-    void configureWithAddress(Address addr) {
-      address_           = addr;
-      defaultBufferSpec_ = BufferSpec(100,10);
-      connectionRetries_ = 100;
-      waitForNetwork_    = false;
-    }
 
     Address address_;
     BufferSpec defaultBufferSpec_;
@@ -68,53 +59,41 @@ namespace K3 {
   class EngineControl : public virtual LogMT
   {
   public:
-    EngineControl(shared_ptr<EngineConfiguration> conf)
-      : LogMT("EngineControl"), config(conf)
-    {
-      terminateV        = shared_ptr<std::atomic<bool>>(new std::atomic<bool>(false));
-      listenerCounter   = shared_ptr<ListenerCounter>(new ListenerCounter());
-      waitMutex         = shared_ptr<boost::mutex>(new boost::mutex());
-      waitCondition     = shared_ptr<boost::condition_variable>(new boost::condition_variable());
-      msgAvailMutex     = shared_ptr<boost::mutex>(new boost::mutex());
-      msgAvailCondition = shared_ptr<boost::condition_variable>(new boost::condition_variable());
-    }
+    EngineControl(EngineConfiguration& conf)
+      : LogMT("EngineControl"), config(conf), terminateV(false)
+    { }
 
     bool terminate() {
       bool net_done = networkDone();
-      bool force_term = !config->waitForNetwork() && (terminateV? terminateV->load() : false);
+      bool force_term = !config.waitForNetwork() && terminateV.load();
       return net_done || force_term;
     }
 
     void set_terminate() {
-      terminateV->store(true);
+      terminateV.store(true);
     }
 
-    bool networkDone() { return listenerCounter? (*listenerCounter)() == 0 : false; }
+    bool networkDone() { return listenerCounter() == 0 ; }
 
     // Wait for a notification that the engine associated
     // with this control object is finished.
-    void waitForEngine()
-    {
-      if ( waitMutex && waitCondition ) {
-        boost::unique_lock<boost::mutex> lock(*waitMutex);
-        while ( !this->terminate() ) { waitCondition->wait(lock); }
-      } else { logAt(boost::log::trivial::warning, "Could not wait for engine, no condition variable available."); }
+    void waitForEngine() {
+      boost::unique_lock<boost::mutex> lock(*waitMutex);
+      while (!terminate()) {
+        waitCondition->wait(lock); 
+      }
     }
 
     // Wait for a notification that the engine associated
     // with this control object has queued messages.
     template <class Predicate>
-    void waitForMessage(Predicate pred)
-    {
-      if (msgAvailMutex && msgAvailCondition) {
-        boost::unique_lock<boost::mutex> lock(*msgAvailMutex);
-        while (pred()) { msgAvailCondition->wait(lock); }
-      } else { logAt(boost::log::trivial::warning, "Could not wait for message, no condition variable available."); }
+    void waitForMessage(Predicate pred) {
+      boost::unique_lock<boost::mutex> lock(*msgAvailMutex);
+      while (pred()) { msgAvailCondition->wait(lock); }
     }
 
     shared_ptr<ListenerControl> listenerControl() {
-      return shared_ptr<ListenerControl>(
-              new ListenerControl(msgAvailMutex, msgAvailCondition, listenerCounter));
+      return make_shared<ListenerControl>(msgAvailMutex, msgAvailCondition, listenerCounter);
     }
 
     void messageAvail() {
@@ -123,21 +102,21 @@ namespace K3 {
 
   protected:
     // Engine configuration, indicating whether we wait for the network when terminating.
-    shared_ptr<EngineConfiguration> config;
+    EngineConfiguration& config;
 
     // Engine termination indicator
-    shared_ptr<std::atomic<bool>> terminateV;
+    std::atomic<bool> terminateV;
 
     // Network listener completion indicator.
-    shared_ptr<ListenerCounter> listenerCounter;
+    ListenerCounter listenerCounter;
 
     // Notifications for threads waiting on the engine.
-    shared_ptr<boost::mutex> waitMutex;
-    shared_ptr<boost::condition_variable> waitCondition;
+    boost::mutex waitMutex;
+    boost::condition_variable waitCondition;
 
     // Notifications for engine worker threads waiting on messages.
-    shared_ptr<boost::mutex> msgAvailMutex;
-    shared_ptr<boost::condition_variable> msgAvailCondition;
+    boost::mutex msgAvailMutex;
+    boost::condition_variable msgAvailCondition;
   };
 
 
@@ -146,8 +125,9 @@ namespace K3 {
 
   class Engine : public LogMT {
   public:
-    typedef map<Identifier, shared_ptr<Net::Listener>> Listeners;
-    Engine() : LogMT("Engine") {}
+    typedef unordered_map<Identifier, shared_ptr<Net::Listener>> Listeners;
+    Engine() : LogMT("Engine"),
+               config_(), control_(config), collectionCount_(0) {}
 
     Engine(
       bool simulation,
@@ -158,7 +138,7 @@ namespace K3 {
       configure(simulation, sys_env, _internal_codec, log_level);
     }
 
-    void configure(bool simulation, SystemEnvironment& sys_env, shared_ptr<InternalCodec> _internal_codec, string log_level);
+    void configure(bool simulation, SystemEnvironment& sys_env, unique_ptr<InternalCodec> _internal_codec, string log_level);
 
     //-----------
     // Messaging.
@@ -177,8 +157,8 @@ namespace K3 {
 
     // TODO: Replace with use of std::bind.
     SendFunctionPtr sendFunction() {
-      return [this](Address a, TriggerId i, shared_ptr<Value> v)
-          { send(RemoteMessage(a, i, *v).toMessage()); };
+      return [this](const Address a, const TriggerId t, const Value& v)
+          { send(RemoteMessage(a, t, v).toMessage()); };
     }
 
     //---------------------------------------
@@ -232,6 +212,7 @@ namespace K3 {
         : invalidEndpointIdentifier("internal", eid);
     }
 
+    // TODO: pass endpoint pointers so we don't have to keep querying the map
     bool hasRead(Identifier eid) {
       if (externalEndpointId(eid)) {
         return endpoints->getExternalEndpoint(eid)->hasRead();
@@ -240,7 +221,7 @@ namespace K3 {
       }
     }
 
-    shared_ptr<Value> doReadExternal(Identifier eid) {
+    unique_ptr<Value> doReadExternal(Identifier eid) {
       return endpoints->getExternalEndpoint(eid)->doRead();
     }
 
@@ -261,8 +242,7 @@ namespace K3 {
     }
 
     void doWriteInternal(Identifier eid, RemoteMessage m) {
-      return endpoints->getInternalEndpoint(eid)->doWrite(
-                make_shared<Value>(internal_codec->show_message(m)));
+      return endpoints->getInternalEndpoint(eid)->doWrite(internal_codec->show_message(m));
     }
 
     //-----------------------
@@ -318,7 +298,7 @@ namespace K3 {
 
     list<Address> nodes() {
       list<Address> r;
-      if ( deployment ) { r = deployedNodes(*deployment); }
+      if (deployment) { r = deployedNodes(*deployment); }
       else { logAt(boost::log::trivial::error, "Invalid system environment."); }
       return r;
     }
@@ -329,7 +309,7 @@ namespace K3 {
     }
 
     bool simulation() {
-      if ( connections ) {
+      if (connections) {
         return !connections->hasInternalConnections(); }
       else { logAt(boost::log::trivial::error, "Invalid connection state."); }
       return false;
@@ -343,22 +323,22 @@ namespace K3 {
     // Converts a K3 channel mode into a native file descriptor mode.
     IOMode ioMode(string k3Mode);
   protected:
-    bool                            log_enabled;
-    shared_ptr<EngineConfiguration> config;
-    shared_ptr<EngineControl>       control;
-    shared_ptr<SystemEnvironment>   deployment;
-    shared_ptr<InternalCodec>       internal_codec;
-    shared_ptr<MessageQueues>       queues;
-    // shared_ptr<WorkerPool>          workers;
-    shared_ptr<Net::NContext>       network_ctxt;
+    bool                logEnabled_;
+    EngineConfiguration config_;
+    EngineControl       control_;
+    SystemEnvironment   deployment_;
+    std::unique_ptr<InternalCodec> internalCodec_;
+    std::unique_ptr<MessageQueues> queues_;
+    // WorkerPool          workers;
+    Net::NContext       networkCtxt_;
 
     // Endpoint and collection tracked by the engine.
-    shared_ptr<EndpointState>       endpoints;
-    shared_ptr<ConnectionState>     connections;
+    EndpointState       endpoints_;
+    std::unique_ptr<ConnectionState> connections_;
 
     // Listeners tracked by the engine.
-    shared_ptr<Listeners>           listeners;
-    unsigned                        collectionCount;
+    Listeners           listeners_;
+    unsigned            collectionCount_;
 
     void logMessageLoop(string s);
 
@@ -369,7 +349,6 @@ namespace K3 {
     }
 
     Builtin builtin(string builtinId);
-
 
 
     // TODO: for all of the genericOpen* endpoint constructors below, revisit:

@@ -3,6 +3,8 @@
 
 #include <list>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <tuple>
 #include <boost/thread/mutex.hpp>
@@ -28,20 +30,20 @@ namespace K3
 
   class BufferException : public runtime_error {
   public:
-    BufferException( const std::string& msg ) : runtime_error(msg) {}
-    BufferException( const char* msg ) : runtime_error(msg) {}
+    BufferException(const std::string& msg) : runtime_error(msg) {}
+    BufferException(const char* msg) : runtime_error(msg) {}
   };
 
   class EndpointException : public runtime_error {
   public:
-    EndpointException( const std::string& msg ) : runtime_error(msg) {}
-    EndpointException( const char* msg ) : runtime_error(msg) {}
+    EndpointException(const std::string& msg) : runtime_error(msg) {}
+    EndpointException(const char* msg) : runtime_error(msg) {}
   };
 
-  typedef std::function<void(const Address&, const TriggerId, shared_ptr<Value>)> SendFunctionPtr;
+  typedef std::function<void(const Address&, const TriggerId, const Value&)> SendFunctionPtr;
 
   class Endpoint;
-  typedef map<Identifier, shared_ptr<Endpoint> > EndpointMap;
+  typedef map<Identifier, Endpoint> EndpointMap;
 
   static inline int bufferMaxSize(BufferSpec& spec)   { return get<0>(spec); }
   static inline int bufferBatchSize(BufferSpec& spec) { return get<1>(spec); }
@@ -58,7 +60,7 @@ namespace K3
 
   static inline bool externalEndpointId(Identifier& id) {
     std::string pfx = internalEndpointPrefix();
-    return ( mismatch(pfx.begin(), pfx.end(), id.begin()).first != pfx.end() );
+    return (mismatch(pfx.begin(), pfx.end(), id.begin()).first != pfx.end());
   }
 
 
@@ -80,21 +82,21 @@ namespace K3
     virtual size_t capacity() = 0;
 
     // Appends to this buffer, returning if the append succeeds.
-    virtual bool push_back(shared_ptr<Value> v) = 0;
+    virtual bool push_back(const Value& v) = 0;
 
     // Maybe Removes a value from the buffer and returns it
-    virtual shared_ptr<Value> pop() = 0;
+    virtual unique_ptr<Value> pop() = 0;
 
     // Attempt to pull a value from the provided IOHandle
     // into the buffer. Returns a Maybe Value
-    virtual shared_ptr<Value> refresh(shared_ptr<IOHandle>, NotifyFn) = 0;
+    virtual unique_ptr<Value> refresh(IOHandle&, NotifyFn) = 0;
 
     // Flush the contents of the buffer out to the provided IOHandle
-    virtual void flush(shared_ptr<IOHandle>, NotifyFn) = 0;
+    virtual void flush(IOHandle&, NotifyFn) = 0;
 
     // Transfer the contents of the buffer into provided MessageQueues
     // Using the provided InternalCodec to convert from Value to Message
-    virtual bool transfer(shared_ptr<MessageQueues>, shared_ptr<InternalCodec>, NotifyFn)= 0;
+    virtual bool transfer(MessageQueues&, InternalCodec&, NotifyFn)= 0;
   };
 
 
@@ -102,98 +104,103 @@ namespace K3
   public:
     typedef ScalarEPBufferMT LockB;
 
-    ScalarEPBufferMT() : EndpointBuffer(), contents(*this) {}
-    // Metadata
-    bool   empty()    {
+    ScalarEPBufferMT() : contents(*this) {}
+
+    bool empty() {
       boost::strict_lock<LockB> guard(*this);
-      return !(contents.get(guard));
+      return contents.get(guard).second;
     }
-    bool   full()     {
-      boost::strict_lock<LockB> guard(*this);
-      return static_cast<bool>(contents.get(guard));
-    }
-    size_t size()     {
-      boost::strict_lock<LockB> guard(*this);
-      return contents.get(guard) ? 1 : 0;
-    }
+    bool   full()     { return !empty(); }
+    size_t size()     { return full() ? 1 : 0; }
     size_t capacity() { return 1; }
 
     // Buffer Operations
-    bool push_back(shared_ptr<Value> v);
+    void push_back(Value& v) {
+      strict_lock<LockB> guard(*this);
+      contents.get(guard).first = v;
+      contents.get(guard).second = false;
+    }
 
-    shared_ptr<Value> pop();
+    unique_ptr<Value> pop() {
+      strict_lock<LockB> guard(*this);
+      if (contents.get(guard).second) { return NULL };
+      Value ret = new Value(contents.get(guard).first);
+      contents.get(guard).first = "";
+      contents.get(guard).second = true;
+      return ret;
+    }
 
-    shared_ptr<Value> refresh(shared_ptr<IOHandle> ioh, NotifyFn notify);
+    unique_ptr<Value> refresh(IOHandle& ioh, NotifyFn notify);
 
-    void flush(shared_ptr<IOHandle> ioh, NotifyFn notify);
+    void flush(IOHandle& ioh, NotifyFn notify);
 
-    bool transfer(shared_ptr<MessageQueues> queues, shared_ptr<InternalCodec> cdec, NotifyFn notify);
+    bool transfer(MessageQueues& queues, InternalCodec& cdec, NotifyFn notify);
 
    protected:
-    boost::externally_locked<shared_ptr<Value>, LockB> contents;
+    // bool is empty
+    boost::externally_locked<pair<Value, bool>>, LockB> contents_;
   };
 
   class ScalarEPBufferST : public EndpointBuffer {
   public:
-    ScalarEPBufferST() : EndpointBuffer() {}
+    ScalarEPBufferST() {}
     // Metadata
-    bool   empty()    { return !contents; }
-    bool   full()     { return static_cast<bool>(contents); }
-    size_t size()     { return contents ? 1 : 0; }
+    bool   empty()    { return empty_; }
+    bool   full()     { return !empty(); }
+    size_t size()     { return full() ? 1 : 0; }
     size_t capacity() { return 1; }
 
     // Buffer Operations
-    bool push_back(shared_ptr<Value> v);
+    bool push_back(const Value& v);
 
-    shared_ptr<Value> pop();
+    unique_ptr<Value> pop();
 
-    shared_ptr<Value> refresh(shared_ptr<IOHandle> ioh, NotifyFn notify);
+    unique_ptr<Value> refresh(IOHandle& ioh, NotifyFn notify);
 
-    void flush(shared_ptr<IOHandle> ioh, NotifyFn notify);
+    void flush(IOHandle& ioh, NotifyFn notify);
 
-    bool transfer(shared_ptr<MessageQueues> queues, shared_ptr<InternalCodec> cdec, NotifyFn notify);
+    bool transfer(MessageQueues& queues, InternalCodec& cdec, NotifyFn notify);
 
    protected:
-    shared_ptr<Value> contents;
+    Value contents_;
+    bool empty_;
   };
 
   class ContainerEPBufferST : public EndpointBuffer {
   public:
-    ContainerEPBufferST(BufferSpec s) : EndpointBuffer(), spec(s) {
-      contents = shared_ptr<list<Value>>(new list<Value>());
-    }
+    ContainerEPBufferST(BufferSpec s) : spec_(s) { }
 
-    bool   empty() { return contents? contents->empty() : true; }
-    bool   full()  { return size() >= bufferMaxSize(spec); }
-    size_t size()  { return empty()? 0 : contents->size(); }
+    bool   empty() { return contents_.empty(); }
+    bool   full()  { return size() >= bufferMaxSize(spec_); }
+    size_t size()  { return empty() ? 0 : contents_.size(); }
     size_t capacity();
 
-    bool push_back(shared_ptr<Value> v);
+    bool push_back(Value& v);
 
-    shared_ptr<Value> pop();
+    unique_ptr<Value> pop();
 
-    shared_ptr<Value> refresh(shared_ptr<IOHandle> ioh, NotifyFn notify);
+    unique_ptr<Value> refresh(IOHandle& ioh, NotifyFn notify);
 
     // Default flush: do not force, wait for batch
-    void flush(shared_ptr<IOHandle> ioh, NotifyFn notify) { flush(ioh,notify,false); }
+    void flush(IOHandle& ioh, NotifyFn notify) { flush(ioh, notify, false); }
 
     // flush overloaded with force flag to ignore batching semantics
-    void flush(shared_ptr<IOHandle> ioh, NotifyFn notify, bool force);
+    void flush(IOHandle& ioh, NotifyFn notify, bool force);
 
     // Default transfer: do not force, wait for batch
-    bool transfer(shared_ptr<MessageQueues> queues, shared_ptr<InternalCodec> cdec, NotifyFn notify) {
-      return transfer(queues,cdec,notify,false);
+    bool transfer(MessageQueues& queues, InternalCodec& cdec, NotifyFn notify) {
+      return transfer(queues, cdec, notify, false);
     }
 
     // transfer overloaded with force flag to ignore batching semantics
-    bool transfer(shared_ptr<MessageQueues> queues, shared_ptr<InternalCodec> cdec, NotifyFn notify, bool force);
+    bool transfer(MessageQueues& queues, InternalCodec& cdec, NotifyFn notify, bool force);
 
    protected:
-    shared_ptr<list<Value>> contents;
-    BufferSpec spec;
+    vector<Value> contents_;
+    BufferSpec spec_;
 
-    int batchSize() { int r = bufferMaxSize(spec); return r <=0? 1 : r;}
-    bool batchAvailable() { return contents? contents->size() >= batchSize(): false;}
+    int batchSize() { int r = bufferMaxSize(spec); return r <=0 ? 1 : r;}
+    bool batchAvailable() { return contents ? contents->size() >= batchSize(): false;}
   };
 
   //----------------------------
@@ -202,10 +209,12 @@ namespace K3
   class EndpointBindings : public LogMT {
   public:
 
-    typedef list<tuple<Address, TriggerId>> Subscribers;
-    typedef map<EndpointNotification, shared_ptr<Subscribers>> Subscriptions;
+    // address, trigger subscribed
+    typedef unordered_set<pair<Address, TriggerId>> Subscribers;
 
-    EndpointBindings(SendFunctionPtr f) : LogMT("EndpointBindings"), sendFn(f) {}
+    typedef unordered_map<EndpointNotification, Subscribers> Subscriptions;
+
+    EndpointBindings(SendFunctionPtr f) : LogMT("EndpointBindings"), sendFn_(f) {}
 
     void attachNotifier(EndpointNotification nt, Address sub_addr, TriggerId sub_id);
 
@@ -214,8 +223,8 @@ namespace K3
     void notifyEvent(EndpointNotification nt, shared_ptr<Value> payload);
 
   protected:
-    SendFunctionPtr sendFn;
-    Subscriptions eventSubscriptions;
+    SendFunctionPtr sendFn_;
+    Subscriptions eventSubscriptions_;
   };
 
   //---------------------------------
@@ -224,21 +233,20 @@ namespace K3
   class Endpoint
   {
   public:
-    Endpoint(shared_ptr<IOHandle> ioh,
-             shared_ptr<EndpointBuffer> buf,
-             shared_ptr<EndpointBindings> subs)
-      : handle_(ioh), buffer_(buf), subscribers_(subs)
+    Endpoint(unique_ptr<IOHandle> ioh,
+             unique_ptr<EndpointBuffer> buf,
+             unique_ptr<EndpointBindings> subs)
+      : handle_(std::move(ioh)), buffer_(std::move(buf)), 
+        subscribers_(std::move(subs))
     {
-      if (handle_->isInput()) {
-        refreshBuffer();
-      }
+      if (handle_->isInput()) { refreshBuffer(); }
     }
 
-    shared_ptr<IOHandle> handle() { return handle_; }
-    shared_ptr<EndpointBuffer> buffer() { return buffer_; }
-    shared_ptr<EndpointBindings> subscribers() { return subscribers_; }
+    IOHandle& handle()              { return handle_; }
+    EndpointBuffer& buffer()        { return buffer_; }
+    EndpointBindings& subscribers() { return subscribers_; }
 
-    void notify_subscribers(shared_ptr<Value> v);
+    void notify_subscribers(Value& v);
 
     // An endpoint can be read if the handle can be read or the buffer isn't empty.
     bool hasRead() { return handle_->hasRead() || !buffer_->empty(); }
@@ -246,28 +254,29 @@ namespace K3
     // An endpoint can be written to if the handle can be written to and the buffer isn't full.
     bool hasWrite() { return handle_->hasWrite() && !buffer_->full(); }
 
-    shared_ptr<Value> refreshBuffer();
+    unique_ptr<Value> refreshBuffer();
 
     void flushBuffer();
 
-    shared_ptr<Value> doRead() { return refreshBuffer(); }
+    unique_ptr<Value> doRead() { return refreshBuffer(); }
 
-    void doWrite(Value& v) { doWrite(make_shared<Value>(v)); }
+    void doWrite(Value& v);
 
-    void doWrite(shared_ptr<Value> v_ptr);
-
-    bool do_push(shared_ptr<Value> val, shared_ptr<MessageQueues> q, shared_ptr<InternalCodec> codec);
+    bool do_push(Value& val, MessageQueues& q, InternalCodec& codec);
 
     // Closes the endpoint's IOHandle, while also notifying subscribers
     // of the close event.
     void close();;
 
   protected:
-    shared_ptr<IOHandle> handle_;
-    shared_ptr<EndpointBuffer> buffer_;
-    shared_ptr<EndpointBindings> subscribers_;
+    unique_ptr<IOHandle> handle_;
+    unique_ptr<EndpointBuffer> buffer_;
+    unique_ptr<EndpointBindings> subscribers_;
   };
 
+
+  // TODO: switch endpointmap to contain endpoints and return references
+  // Nobody else owns endpoints
 
   class EndpointState : public boost::basic_lockable_adapter<boost::mutex>
   {
@@ -275,20 +284,19 @@ namespace K3
     typedef boost::basic_lockable_adapter<boost::mutex> eplockable;
 
     using ConcurrentEndpointMap =
-      boost::externally_locked<shared_ptr<EndpointMap>,EndpointState>;
+      boost::externally_locked<EndpointMap, EndpointState>;
 
     using EndpointDetails = tuple<shared_ptr<IOHandle>,
                                  shared_ptr<EndpointBuffer>,
                                  shared_ptr<EndpointBindings> >;
 
     EndpointState()
-      : eplockable(), epsLogger(new LogMT("EndpointState")),
-        internalEndpoints(emptyEndpointMap()),
-        externalEndpoints(emptyEndpointMap())
+      : eplockable(),
+        epsLogger_(LogMT("EndpointState"))
     {}
 
     void addEndpoint(Identifier id, EndpointDetails details) {
-      if ( externalEndpointId(id) ) {
+      if (externalEndpointId(id)) {
         addEndpoint(id, details, externalEndpoints);
       } else {
         addEndpoint(id, details, internalEndpoints);
@@ -296,7 +304,7 @@ namespace K3
     }
 
     void removeEndpoint(Identifier id) {
-      if ( externalEndpointId(id) ) {
+      if (externalEndpointId(id)) {
         removeEndpoint(id, externalEndpoints);
       } else {
         removeEndpoint(id, internalEndpoints);
@@ -304,65 +312,45 @@ namespace K3
     }
 
     void clearEndpoints() {
-      clearEndpoints(internalEndpoints);
-      clearEndpoints(externalEndpoints);
+      clearEndpoints(internalEndpoints_);
+      clearEndpoints(externalEndpoints_);
       return;
     }
 
-    void clearEndpoints(shared_ptr<ConcurrentEndpointMap> m);
+    void clearEndpoints(ConcurrentEndpointMap& m);
 
-    shared_ptr<Endpoint> getInternalEndpoint(Identifier id);
+    // Pointer has no ownership
+    Endpoint* getInternalEndpoint(const Identifier& id);
 
-    shared_ptr<Endpoint> getExternalEndpoint(Identifier id);
+    // Pointer has no ownership
+    Endpoint* getExternalEndpoint(const Identifier& id);
 
     size_t numEndpoints();
 
     void logEndpoints();
 
   protected:
-    shared_ptr<LogMT> epsLogger;
-    shared_ptr<ConcurrentEndpointMap> internalEndpoints;
-    shared_ptr<ConcurrentEndpointMap> externalEndpoints;
-
-    shared_ptr<ConcurrentEndpointMap> emptyEndpointMap()
-    {
-      shared_ptr<EndpointMap> m = shared_ptr<EndpointMap>(new EndpointMap());
-      return shared_ptr<ConcurrentEndpointMap>(new ConcurrentEndpointMap(*this, m));
-    }
-
+    LogMT epsLogger_;
+    ConcurrentEndpointMap internalEndpoints_;
+    ConcurrentEndpointMap externalEndpoints_;
 
     void addEndpoint(Identifier id, EndpointDetails details,
-                     shared_ptr<ConcurrentEndpointMap> epMap)
+                     ConcurrentEndpointMap& epMap);
+
+    void removeEndpoint(Identifier id, ConcurrentEndpointMap& epMap)
     {
       boost::strict_lock<EndpointState> guard(*this);
-      auto lb = epMap->get(guard)->lower_bound(id);
-
-      if ( lb == epMap->get(guard)->end() || id != lb->first )
-      {
-        shared_ptr<Endpoint> ep =
-          shared_ptr<Endpoint>(new Endpoint(get<0>(details), get<1>(details), get<2>(details)));
-
-        epMap->get(guard)->insert(lb, make_pair(id, ep));
-      } else if ( epsLogger ) {
-        BOOST_LOG(*epsLogger) << "Invalid attempt to add a duplicate endpoint for " << id;
-      }
+      epMap.get(guard).erase(id);
     }
 
-    void removeEndpoint(Identifier id, shared_ptr<ConcurrentEndpointMap> epMap)
-    {
+    void EndpointState::clearEndpoints(ConcurrentEndpointMap& m) {
       boost::strict_lock<EndpointState> guard(*this);
-      epMap->get(guard)->erase(id);
+      m.clear();
     }
 
-    shared_ptr<Endpoint>
-    getEndpoint(Identifier id, shared_ptr<ConcurrentEndpointMap> epMap)
-    {
-      boost::strict_lock<EndpointState> guard(*this);
-      shared_ptr<Endpoint> r;
-      auto it = epMap->get(guard)->find(id);
-      if ( it != epMap->get(guard)->end() ) { r = it->second; }
-      return r;
-    }
+    // TODO: allow direct access to endpoints (saving them) so we don't have to
+    // keep going through the map
+    Endpoint* getEndpoint(Identifier id, ConcurrentEndpointMap& epMap);
   };
 
 
@@ -376,31 +364,28 @@ namespace K3
     // ever used by ConnectionState methods (which are thread-safe).
     class ConnectionMap : public virtual LogMT {
     public:
-      ConnectionMap() : LogMT("ConnectionMap") {}
+      ConnectionMap(Net::NContext& ctxt): LogMT("ConnectionMap"), context_(ctxt) {}
 
-      ConnectionMap(shared_ptr<Net::NContext> ctxt): LogMT("ConnectionMap"), context_(ctxt) {}
+      bool addConnection(Address& addr, const Net::NConnection& c);
 
-      bool addConnection(Address& addr, shared_ptr<Net::NConnection> c);
-
-      shared_ptr<Net::NConnection> getConnection(Address& addr);
+      // no ownership return
+      Net::NConnection* getConnection(Address& addr);
 
       void removeConnection(Address& addr) { cache.erase(addr); }
 
-      void clearConnections() { cache.clear(); }
+      void clearConnections() { cache_.clear(); }
 
-      size_t size() { return cache.size(); }
+      size_t size() { return cache_.size(); }
 
     protected:
-      shared_ptr<Net::NContext> context_;
-      map<Address, shared_ptr<Net::NConnection> > cache;
+      Net::NContext& context_; // owned by outside
+      unordered_map<Address, Net::NConnection> cache_;
    };
 
   public:
     typedef boost::shared_lockable_adapter<boost::shared_mutex> shlockable;
 
-    typedef boost::externally_locked<shared_ptr<ConnectionMap>, ConnectionState>
-              ConcurrentConnectionMap;
-
+    typedef boost::externally_locked<ConnectionMap, ConnectionState> ConcurrentConnectionMap;
 
     ConnectionState(shared_ptr<Net::NContext> ctxt)
       : shlockable(), LogMT("ConnectionState"),

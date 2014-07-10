@@ -32,7 +32,7 @@ namespace K3 {
       Codec(): LogMT("Codec") {}
 
       virtual Value encode(const Value&) = 0;
-      virtual std::shared_ptr<Value> decode(const Value&) = 0;
+      virtual Value decode(const Value&) = 0;
       virtual bool decode_ready() = 0;
       virtual bool good() = 0;
 
@@ -48,22 +48,14 @@ namespace K3 {
 
       Value encode(const Value& v) { return v; }
 
-      std::shared_ptr<Value> decode(const Value& v) {
-        std::shared_ptr<Value> result;
-        if (v != "") {
-          result = std::make_shared<Value>(v);
-        }
-        return result;
-
-      }
+      Value decode(const Value& v) { return v; }
 
       bool decode_ready() { return true; }
 
       bool good() { return good_; }
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<DefaultCodec>(new DefaultCodec());
-        return cdec;
+        return std::make_shared<DefaultCodec>();
       };
 
     protected:
@@ -81,57 +73,56 @@ namespace K3 {
   class DelimiterCodec : public virtual Codec, public virtual LogMT {
     public:
       DelimiterCodec(char delimiter)
-        : Codec(), LogMT("DelimiterCodec"), delimiter_(delimiter), good_(true), buf_(new std::string())
+        : Codec(), LogMT("DelimiterCodec"), delimiter_(delimiter), good_(true)
       {}
 
       Value encode(const Value& v);
 
-      std::shared_ptr<Value> decode(const Value& v);
+      Value decode(const Value& v);
 
       bool decode_ready() {
-       return buf_?
-          find_delimiter() != std::string::npos : false;
+          return (find_delimiter() != std::string::npos);
       }
 
       bool good() { return good_; }
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<DelimiterCodec>(new DelimiterCodec(delimiter_));
-        return cdec;
-      };
+        return std::make_shared<DelimiterCodec>(delimiter_);
+      }
 
       char delimiter_;
     protected:
-      size_t find_delimiter() { return buf_->find(delimiter_); }
+      size_t find_delimiter() { return buf_.find(delimiter_); }
       bool good_;
-      std::shared_ptr<std::string> buf_;
+      std::string buf_;
   };
 
   class LengthHeaderCodec : public virtual Codec, public virtual LogMT {
     public:
       LengthHeaderCodec()
-        : Codec(), LogMT("LengthHeaderCodec"), good_(true), buf_(new std::string()), next_size_(NULL)
+        : Codec(), LogMT("LengthHeaderCodec"), good_(true),
+          next_size_(0), have_size_(false)
       {}
 
       Value encode(const Value& s);
 
-      std::shared_ptr<Value> decode(const Value& v);
+      Value decode(const Value& v);
 
       bool decode_ready() {
-        return next_size_? buf_->length() >= *next_size_ : false;
+        return have_size_ ? buf_.length() >= next_size_ : false;
       }
 
       bool good() { return good_; }
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<LengthHeaderCodec>(new LengthHeaderCodec());
-        return cdec;
+        return std::make_shared<LengthHeaderCodec>();
       };
 
     protected:
       bool good_;
-      std::shared_ptr<fixed_int> next_size_;
-      std::shared_ptr<std::string> buf_;
+      bool have_size_;
+      fixed_int next_size_;
+      std::string buf_;
 
       void strip_header();
   };
@@ -152,25 +143,20 @@ namespace K3 {
       {}
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<DefaultInternalCodec>(new DefaultInternalCodec());
-        return cdec;
-      };
+        return std::make_shared<DefaultInternalCodec>();
+      }
 
   };
 
   class DelimiterInternalCodec : public AbstractDefaultInternalCodec, public DelimiterCodec, public virtual LogMT {
     public:
       DelimiterInternalCodec(char delimiter)
-        : AbstractDefaultInternalCodec(), DelimiterCodec(delimiter), LogMT("DelimiterInternalCodec"), delimiter_(delimiter)
+        : AbstractDefaultInternalCodec(), DelimiterCodec(delimiter), LogMT("DelimiterInternalCodec")
       {}
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<DelimiterInternalCodec>(new DelimiterInternalCodec(delimiter_));
-        return cdec;
-      };
-
-    protected:
-      char delimiter_;
+        return std::make_shared<DelimiterInternalCodec>(delimiter_);
+      }
   };
 
   class LengthHeaderInternalCodec : public AbstractDefaultInternalCodec, public LengthHeaderCodec, public virtual LogMT {
@@ -180,10 +166,8 @@ namespace K3 {
       {}
 
       std::shared_ptr<Codec> freshClone() {
-        std::shared_ptr<Codec> cdec = std::shared_ptr<LengthHeaderInternalCodec>(new LengthHeaderInternalCodec());
-        return cdec;
-      };
-
+        return std::make_shared<LengthHeaderInternalCodec>();
+      }
   };
 
   using ExternalCodec = Codec;

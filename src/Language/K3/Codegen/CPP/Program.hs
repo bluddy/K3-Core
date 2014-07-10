@@ -104,13 +104,12 @@ genKMain = do
             text "SystemEnvironment se = defaultEnvironment(addr_l);",
             genCCall (text "engine.configure") Nothing
               [text "opt.simulation", text "se",
-               text "make_shared<DefaultInternalCodec>(DefaultInternalCodec())",
+               text "unique_ptr<DefaultInternalCodec>(new DefaultInternalCodec())",
                text "opt.log_level"] <> semi,
             genCCall (text "processRole") Nothing [text "unit_t()"] <> semi,
-            genCDecl (text "DispatchMessageProcessor") (text "dmp") (Just $
-              genCCall (text "DispatchMessageProcessor") Nothing
-                [text showGlobalsName]) <> semi,
-            text "engine.runEngine(make_shared<DispatchMessageProcessor>(dmp))" <> semi,
+            text "engine.runEngine" <>
+              parens (text "make_shared<DispatchMessageProcessor>" <>
+                parens (text "show_globals")) <> semi,
             text "return 0" <> semi
         ]
 

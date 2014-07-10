@@ -12,20 +12,19 @@ namespace K3 {
         return res;
       }
 
-      shared_ptr<Value> DelimiterCodec::decode(const Value& v) {
+      Value DelimiterCodec::decode(const Value& v) {
 
         // Append to buffer
-        buf_->append(v);
+        buf_.append(v);
         // Determine if there is a complete value in the buffer
-        shared_ptr<Value> result = shared_ptr<Value>();
+        Value result = "";
         size_t pos = find_delimiter();
         if (pos != std::string::npos) {
           // There is a complete value
           // Grab it from the buffer
-          result = shared_ptr<string>(new string());
-          *result = buf_->substr(0, pos); // ignore the delimiter at pos
+          result = buf_->substr(0, pos); // ignore the delimiter at pos
           // Delete from the buffer
-          *buf_ = buf_->substr(pos+1);
+          buf_ = buf_->substr(pos+1);
         }
         return result;
       }
@@ -36,28 +35,26 @@ namespace K3 {
         size_t header_size = sizeof(value_size);
         size_t enc_size = header_size + value_size;
         // pack data into a buffer
-        char * buffer = new char[enc_size]();
-        memcpy(buffer, &value_size, header_size);
-        memcpy(buffer + header_size, s.c_str(), value_size);
-        // copy into string and free buffer
-        Value enc_v = string(buffer, enc_size);
-        delete[] buffer;
+        string result;
+        result.resize(enc_size);
+        memcpy(result.c_str(), &value_size, header_size);
+        memcpy(result.c_str() + header_size, s.c_str(), value_size);
 
-        return enc_v;
+        return result;
       }
 
-      shared_ptr<Value> LengthHeaderCodec::decode(const Value& v) {
+      Value LengthHeaderCodec::decode(const Value& v) {
 
         if (v != "") {
-        *buf_ = *buf_ + v;
+          buf_ = buf_ + v;
         }
 
-        if (!next_size_) {
+        if (!have_size_) {
           // See if there is enough data in buffer to unpack a header
           strip_header();
-          if (!next_size_) {
+          if (!have_size_) {
             // failure: not enough data in buffer
-            return nullptr;
+            return Value("");
           }
         }
 
@@ -65,44 +62,39 @@ namespace K3 {
         // See if the buffer contains enough data to unpack
         if (decode_ready()) {
           // Unpack next value
-          const char * bytes = buf_->c_str();
-          fixed_int i = *next_size_;
-          shared_ptr<Value> result = shared_ptr<Value>(new string(bytes, i));
+          const char * bytes = buf_.c_str();
+          Value result(bytes, next_size_);
 
           // Setup for next round
-          *buf_ = buf_->substr(i);
-          next_size_.reset();
+          *buf_ = buf_->substr(next_size_);
+          have_next_size_ = false;
           return result;
         }
         else {
           // failure: not enough data in buffer
-          return nullptr;
+          return Value("");
         }
       }
 
       void LengthHeaderCodec::strip_header() {
-        Value s = *buf_;
         size_t header_size = sizeof(fixed_int);
-        if (s.length() < header_size) {
+        if (buf_.length() < header_size) {
           // failure: input does not contain a full header
           return;
         }
-        const char * bytes = s.c_str();
+
         // copy the fixed_int into next_size_
-        fixed_int * n = new fixed_int();
-        memcpy(n, bytes, header_size);
-        next_size_ = shared_ptr<fixed_int>(new fixed_int(*n));
-        delete n;
+        memcpy(&next_size_, buf_.c_str(), header_size);
+        have_size_ = true;
 
         // remove the header bytes from the buffer
-        *buf_ = buf_->substr(header_size);
+        buf_ = buf_->substr(header_size);
       }
 
       RemoteMessage AbstractDefaultInternalCodec::read_message(const Value& v) {
         // Values are of the form: "(Address, Identifier, Payload)"
         // Split value into components:
         static const boost::regex value_regex("\\( *(.+) *, *(.+) *, *(.+) *\\)");
-        //logAt(trivial::trace, v);
         boost::cmatch value_match;
         if(boost::regex_match(v.c_str(), value_match, value_regex)){
           // Parse Address
@@ -139,5 +131,5 @@ namespace K3 {
         string s = os.str();
         return s;
       }
-}
+} // namespace K3
 

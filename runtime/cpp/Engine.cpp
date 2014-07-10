@@ -6,8 +6,12 @@ using boost::thread;
 
 namespace K3 {
 
-    void Engine::configure(bool simulation, SystemEnvironment& sys_env, shared_ptr<InternalCodec> _internal_codec, string log_level) {
-      internal_codec = _internal_codec;
+    void Engine::configure(bool simulation, 
+                           SystemEnvironment& sys_env, 
+                           unique_ptr<InternalCodec> _internal_codec, 
+                           string log_level) {
+      internalCodec = std::move(_internal_codec);
+      // Simple log levels for now
       if (log_level != "") { log_enabled = true; }
       list<Address> processAddrs = deployedNodes(sys_env);
       Address initialAddress;
@@ -18,17 +22,12 @@ namespace K3 {
         logAt(warning, "No deployment peer addresses found, using a default address.");
         initialAddress = defaultAddress;
       }
+      config_.setAddress(initialAddress);
 
-      config       = shared_ptr<EngineConfiguration>(new EngineConfiguration(initialAddress));
-      control      = shared_ptr<EngineControl>(new EngineControl(config));
-      deployment   = shared_ptr<SystemEnvironment>(new SystemEnvironment(sys_env));
+      deployment   = sys_env;
       // workers     = shared_ptr<WorkerPool>(new InlinePool());
-      network_ctxt = shared_ptr<Net::NContext>(new Net::NContext());
-      endpoints    = shared_ptr<EndpointState>(new EndpointState());
-      listeners    = shared_ptr<Listeners>(new Listeners());
-      collectionCount   = 0;
 
-      if ( simulation ) {
+      if (simulation) {
         // Simulation engine initialization.
 
         if (processAddrs.size() <= 1) {
@@ -37,12 +36,12 @@ namespace K3 {
           queues = perPeerQueues(processAddrs);
         }
 
-        connections = shared_ptr<ConnectionState>(new ConnectionState(network_ctxt, true));
+        connections_ = unique_ptr<ConnectionState>(new ConnectionState(network_ctxt, true));
       }
       else {
         // Network engine initialization.
-        queues      = perPeerQueues(processAddrs);
-        connections = shared_ptr<ConnectionState>(new ConnectionState(network_ctxt, false));
+        queues_      = perPeerQueues(processAddrs);
+        connections_ = unique_ptr<ConnectionState>(new ConnectionState(network_ctxt, false));
 
         // Start network listeners for all K3 processes on this engine.
         // This opens engine sockets with an internal codec, relying on openSocketInternal()
@@ -67,8 +66,8 @@ namespace K3 {
           // Directly enqueue.
           // TODO: ensure we avoid copying the dispatcher
           Message msg(addr, triggerId, disp);
-          queues->enqueue(msg);
-          control->messageAvail();
+          queues_->enqueue(msg);
+          control_.messageAvail();
 
         } else {
           RemoteMessage rMsg(addr, triggerId, disp->pack());
@@ -77,8 +76,8 @@ namespace K3 {
           Identifier eid = connectionId(addr);
           bool sent = false;
 
-          for (int i = 0; !sent && i < config->connectionRetries(); ++i) {
-            shared_ptr<Endpoint> ep = endpoints->getInternalEndpoint(eid);
+          for (int i = 0; !sent && i < config_.connectionRetries(); ++i) {
+            shared_ptr<Endpoint> ep = endpoints_.getInternalEndpoint(eid);
 
             if ( ep && ep->hasWrite() ) {
               shared_ptr<Value> v = make_shared<Value>(internal_codec->show_message(rMsg));

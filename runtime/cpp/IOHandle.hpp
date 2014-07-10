@@ -26,10 +26,10 @@ namespace K3
     virtual bool isInput() = 0;
     virtual bool isOutput() = 0;
     virtual bool hasRead() = 0;
-    virtual unique_ptr<Value> doRead() = 0;
+    virtual Value doRead() = 0;
 
     virtual bool hasWrite() = 0;
-    virtual void doWrite(const Value& v) = 0;
+    virtual void doWrite(Value& v) = 0;
 
     virtual void close() = 0;
 
@@ -57,14 +57,14 @@ namespace K3
         return (input_.good() && codec->good()) || codec->decode_ready();
     }
 
-    unique_ptr<string> doRead();
+    string doRead();
 
     bool hasWrite() {
       BOOST_LOG(*this) << "Invalid write operation on input handle";
       return false;
     }
 
-    void doWrite(const Value &data) {
+    void doWrite(Value &data) {
       BOOST_LOG(*this) << "Invalid write operation on input handle";
     }
 
@@ -92,14 +92,14 @@ namespace K3
       return false;
     }
 
-    unique_ptr<Value> doRead() {
+    Value doRead() {
       BOOST_LOG(*this) << "Invalid read operation on output handle";
-      return unique_ptr<Value>();
+      return Value("");
     }
 
     bool hasWrite() { return output.good(); }
 
-    void doWrite(const Value& data ) { output << codec->encode(data); }
+    void doWrite(Value& data ) { output << codec->encode(data); }
 
     void close() { output.reset(); }
 
@@ -118,14 +118,15 @@ namespace K3
 
     template<typename Source>
     StreamHandle(shared_ptr<Codec> cdec, Input i, Source& src)
-      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(true),
-        inImpl(unique_ptr<IStreamHandle>(new IStreamHandle(cdec, src)))
-    { }
+      : LogMT("StreamHandle"), IOHandle(cdec), isInput_(true)
+    { 
+      inImpl_ = unique_ptr<IStreamHandle>(new IStreamHandle(cdec, src));
+    }
 
     template<typename Sink>
     StreamHandle(shared_ptr<Codec>  cdec, Output o, Sink& sink)
       : LogMT("StreamHandle"), IOHandle(cdec), isInput_(false),
-        outImpl(unique_ptr<OStreamHandle>(new OStreamHandle(cdec, sink)))
+        outImpl_(unique_ptr<OStreamHandle>(new OStreamHandle(cdec, sink)))
     { }
 
     bool isInput()  { return isInput_; }
@@ -136,42 +137,42 @@ namespace K3
 
     bool hasRead()  {
       bool r = false;
-      if (inImpl) { r = inImpl->hasRead(); }
+      if (inImpl_) { r = inImpl_->hasRead(); }
       else { BOOST_LOG(*this) << "Invalid hasRead on LineBasedHandle"; }
       return r;
     }
 
     bool hasWrite() {
       bool r = false;
-      if (outImpl) { r = outImpl->hasWrite(); }
+      if (outImpl_) { r = outImpl_->hasWrite(); }
       else { BOOST_LOG(*this) << "Invalid hasWrite on LineBasedHandle"; }
       return r;
     }
 
-    unique_ptr<Value> doRead() {
-      unique_ptr<Value> data;
-      if (inImpl) {
-        data = inImpl->doRead();
+    Value doRead() {
+      if (inImpl_) {
+        return inImpl_->doRead();
+      } else {
+        BOOST_LOG(*this) << "Invalid doRead on LineBasedHandle";
+        return Value("");
       }
-      else { BOOST_LOG(*this) << "Invalid doRead on LineBasedHandle"; }
-      return data;
     }
 
     void doWrite(Value& v) {
-      if (outImpl) {
-        outImpl->doWrite(v);
+      if (outImpl_) {
+        outImpl_->doWrite(v);
       }
       else { BOOST_LOG(*this) << "Invalid doWrite on LineBasedHandle"; }
     }
 
     void close() {
-      if (inImpl) { inImpl->close(); }
-      else if (outImpl) { outImpl->close(); }
+      if (inImpl_) { inImpl_->close(); }
+      else if (outImpl_) { outImpl_->close(); }
     }
 
   protected:
-    unique_ptr<IStreamHandle> inImpl;
-    unique_ptr<OStreamHandle> outImpl;
+    unique_ptr<IStreamHandle> inImpl_;
+    unique_ptr<OStreamHandle> outImpl_;
     bool isInput_;
   };
 
@@ -215,11 +216,11 @@ namespace K3
   class FileHandle : public StreamHandle
   {
   public:
-    FileHandle(shared_ptr<Codec> cdec, const file_sink &fs, StreamHandle::Input i)
+    FileHandle(shared_ptr<Codec> cdec, file_source &fs, StreamHandle::Input i)
       : StreamHandle(cdec, i, fs), LogMT("FileHandle")
     {}
 
-    FileHandle(shared_ptr<Codec> cdec, const file_sink &fs, StreamHandle::Output o)
+    FileHandle(shared_ptr<Codec> cdec, file_sink &fs, StreamHandle::Output o)
       : StreamHandle(cdec, o, fs), LogMT("FileHandle")
     {}
 
@@ -264,9 +265,9 @@ namespace K3
       return r;
     }
 
-    unique_ptr<Value> doRead() {
+    Value doRead() {
       BOOST_LOG(*this) << "Invalid doRead on NetworkHandle";
-      return unique_ptr<Value>();
+      return Value("");
     }
 
     void doWrite(Value&  v) {
@@ -300,8 +301,8 @@ namespace K3
     }
 
   protected:
-    unique_ptr<Net::NConnection> connection;
-    unique_ptr<Net::NEndpoint>   endpoint;
+    shared_ptr<Net::NConnection> connection;
+    shared_ptr<Net::NEndpoint> endpoint;
     bool isInput_;
   };
 

@@ -3,7 +3,7 @@
 
 #include <cstdint>
 #include <list>
-#include <map>
+#include <unordered_map>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -101,8 +101,8 @@ namespace K3 {
 
   // Literals are native values rather than an AST reprensentation as in Haskell.
   typedef boost::any Literal;
-  typedef std::map<Identifier, Literal> PeerBootstrap;
-  typedef std::map<Address, PeerBootstrap> SystemEnvironment;
+  typedef std::unordered_map<Identifier, Literal> PeerBootstrap;
+  typedef std::unordered_map<Address, PeerBootstrap> SystemEnvironment;
 
   static inline SystemEnvironment defaultEnvironment(Address addr) {
     PeerBootstrap bootstrap = PeerBootstrap();

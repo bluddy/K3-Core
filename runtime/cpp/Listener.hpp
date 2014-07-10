@@ -26,9 +26,9 @@ namespace K3 {
   public:
     ListenerCounter() : std::atomic_uint(0) {}
 
-    void registerListener() { this->fetch_add(1); }
-    void deregisterListener() { this->fetch_sub(1); }
-    unsigned int operator()() { return this->load(); }
+    void registerListener()   { fetch_add(1); }
+    void deregisterListener() { fetch_sub(1); }
+    unsigned int operator()() { return load(); }
   };
 
   //---------------------------------------------------------------
@@ -37,39 +37,36 @@ namespace K3 {
   class ListenerControl {
   public:
 
-    ListenerControl(shared_ptr<boost::mutex> m, shared_ptr<boost::condition_variable> c,
-                    shared_ptr<ListenerCounter> i)
-      : listenerCounter(i), msgAvailable(false), msgAvailMutex(m), msgAvailCondition(c)
+    // TODO: get rid of mutex and bool. condition variable covers it already
+    ListenerControl(boost::mutex& m, boost::condition_variable& c,
+                    ListenerCounter& i)
+      : listenerCounter_(i), msgAvailable_(false), msgAvailMutex_(m), msgAvailCondition_(c)
     {}
 
     // Waits on the message available condition variable.
-    void waitForMessage()
-    {
-      boost::unique_lock<boost::mutex> lock(*msgAvailMutex);
-      while ( !msgAvailable ) { msgAvailCondition->wait(lock); }
+    void waitForMessage() {
+      boost::unique_lock<boost::mutex> lock(msgAvailMutex);
+      while (!msgAvailable_) { msgAvailCondition_.wait(lock); }
     }
 
     // Notifies one waiter on the message available condition variable.
-    void messageAvailable()
-    {
-      {
-        boost::lock_guard<boost::mutex> lock(*msgAvailMutex);
-        msgAvailable = true;
-      }
-      msgAvailCondition->notify_one();
+    void messageAvailable() {
+      boost::lock_guard<boost::mutex> lock(msgAvailMutex_);
+      msgAvailable_ = true;
+      msgAvailCondition_->notify_one();
     }
 
-    shared_ptr<ListenerCounter> counter() { return listenerCounter; }
+    ListenerCounter& counter() { return listenerCounter_; }
 
-    shared_ptr<boost::mutex> msgMutex() { return msgAvailMutex; }
-    shared_ptr<boost::condition_variable> msgCondition() { return msgAvailCondition; }
+    boost::mutex& msgMutex()   { return msgAvailMutex_; }
+    boost::condition_variable& msgCondition() { return msgAvailCondition_; }
 
   protected:
-    shared_ptr<ListenerCounter> listenerCounter;
+    ListenerCounter listenerCounter_;
 
-    bool msgAvailable;
-    shared_ptr<boost::mutex> msgAvailMutex;
-    shared_ptr<boost::condition_variable> msgAvailCondition;
+    bool msgAvailable_;
+    boost::mutex msgAvailMutex_;
+    boost::condition_variable msgAvailCondition_;
   };
 
   //------------
@@ -238,7 +235,7 @@ namespace K3 {
                 ostringstream os2;
                 size_t len = s->length();
 
-                shared_ptr<Value> v = cdec->decode(*s);
+                Value v = cdec->decode(*s);
                 delete s;
                 // Exhaust the codec's buffer
                 while (v) {
