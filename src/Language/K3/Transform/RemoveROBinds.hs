@@ -92,9 +92,11 @@ transformExpr e = evalState computation 1
     -- For the first child, we always send the same set we already have, since the first child
     -- of a bind does not get the bind's assignment
     -- Lambda modifies its child's context
-    sendProjection :: Monad m => BindMap -> K3 Expression -> K3 Expression -> m BindMap
-    sendProjection acc _ (tag -> ELambda nm) = return $ Map.delete nm acc
-    sendProjection acc _ _ = return acc
+    --
+    -- TODO: fix this, as it was checking the first child
+    sendProjection :: Monad m => BindMap -> K3 Expression -> m BindMap
+    sendProjection acc (tag -> ELambda nm) = return $ Map.delete nm acc
+    sendProjection acc _ = return acc
 
     removeFromMap ids acc ch =
       let m = foldr Map.delete acc ids in
@@ -102,7 +104,7 @@ transformExpr e = evalState computation 1
 
     -- Send down a union of the current ro-set and the one found at this node (if any)
     -- Let, case and bind capture in the 2nd child's context only
-    ch1SendProjection :: BindMap -> K3 Expression -> K3 Expression -> State Int (BindMap, [BindMap])
+    ch1SendProjection :: BindMap -> K3 Expression -> K3 Expression -> State Int (BindMap, BindMap)
     ch1SendProjection acc _ (details -> (ELetIn nm, ch, _))  = removeFromMap [nm] acc ch
     ch1SendProjection acc _ (details -> (ECaseOf nm, ch, _)) = removeFromMap [nm] acc ch
 
@@ -120,9 +122,9 @@ transformExpr e = evalState computation 1
           roIds'   = Map.fromList $ map (\x -> (x, fromMaybe (error "Missing binds") $ Map.lookup x bindIds)) roIds
           -- bind captures some ids, and makes others read-only
           acc'     = (acc `Map.difference` bindIds) `Map.union` roIds'
-      return (acc', replicateCh chs acc') -- send to all the other children
+      return (acc', acc') -- send to all the other children
 
-    ch1SendProjection acc _ (Node _ ch) = return (acc, replicateCh ch acc)
+    ch1SendProjection acc _ (Node _ ch) = return (acc, acc)
 
     -- Tranform variable accesses -> projections
     handleNode :: Monad m => BindMap -> [K3 Expression] -> K3 Expression -> m (K3 Expression)
