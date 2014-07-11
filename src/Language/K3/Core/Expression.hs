@@ -234,3 +234,19 @@ stripAnnotations = runIdentity . mapTree strip
 --   (such as UIDs, spans, etc.)
 compareWithoutAnnotations :: K3 Expression -> K3 Expression -> Bool
 compareWithoutAnnotations e1 e2 = stripAnnotations e1 == stripAnnotations e2
+
+-- | Special foldMapInXRebuildTree for expressions
+-- | For apply, it does the second node first
+-- | For other nodes (including bind/let), it does the 1st node first
+exprFoldMapRebuildTree :: (Monad m)
+                  => (b -> K3 Expression   -> m b)
+                  -> (b -> K3 Expression   -> K3 Expression -> m (b, b))
+                  -> (b -> [K3 Expression] -> K3 Expression -> m (K3 Expression))
+                  -> b  -> K3 Expression   -> m (K3 Expression)
+exprFoldMapRebuildTree preF post1F allF tdAcc =
+  foldMapInXRebuildTree preX post1F allF tdAcc
+  where
+    -- For apply, we do the second child first
+    preX acc n@(tag -> EOperate OApp) = preF acc n >>= \x -> return (x, 1)
+    -- Generic case: do first child first
+    preX acc n = preF acc n >>= \x -> return (x, 0)

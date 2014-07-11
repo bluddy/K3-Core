@@ -96,12 +96,9 @@ transformExpr e = evalState computation 1
     sendProjection acc _ (tag -> ELambda nm) = return $ Map.delete nm acc
     sendProjection acc _ _ = return acc
 
-    replicateCh ch = replicate (length ch - 1)
-
-    -- The post-child function requires a tuple, so let's duplicate it
     removeFromMap ids acc ch =
       let m = foldr Map.delete acc ids in
-      return (m, replicateCh ch m)
+      return (m, m)
 
     -- Send down a union of the current ro-set and the one found at this node (if any)
     -- Let, case and bind capture in the 2nd child's context only

@@ -2,6 +2,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
+{-# LANGUAGE TupleSections #-}
 
 -- | The K3 Annotation System.
 module Language.K3.Core.Annotation (
@@ -30,6 +31,7 @@ module Language.K3.Core.Annotation (
     foldMapRebuildTree,
     mapIn1RebuildTree,
     foldIn1RebuildTree,
+    foldMapInXRebuildTree,
     foldMapIn1RebuildTree
 ) where
 
@@ -266,6 +268,54 @@ mapIn1RebuildTree preCh1F postCh1F allChF n@(Node _ ch) = do
 
   where rcr = mapIn1RebuildTree preCh1F postCh1F allChF
 
+-- | A mapping variant of foldIn1RebuildTree that threads a top-down accumulator
+--   while reconstructing the tree.
+-- preCh1F:  The pre-child function takes the top-down accumulator and the node.
+--           It returns a new accumulator
+-- postCh1F: The post-child function takes the pre's accumulator, the processed
+--           first child, and the node. It returns an accumulator for the allFn
+--           and an accumulator to be sent down while recursing over the other
+--           children.
+-- allChF:   The all-child function takes the post child's single accumulator,
+--           the processed children, and the node, and returns a new tree.
+foldMapIn1RebuildTree :: (Monad m)
+                  => (b -> Tree a -> m b)
+                  -> (b -> Tree a -> Tree a -> m (b, b))
+                  -> (b -> [Tree a] -> Tree a -> m (Tree a))
+                  -> b -> Tree a -> m (Tree a)
+foldMapIn1RebuildTree _ _ allChF tdAcc n@(Node _ []) = allChF tdAcc [] n
+foldMapIn1RebuildTree preCh1F postCh1F allChF tdAcc n =
+  foldMapInXRebuildTree preChXF postCh1F allChF tdAcc n
+    where preChXF a b = preCh1F a b >>= \x -> return (x, 0)
+
+
+-- | A variant of foldIn1RebuildTree that allows any child to be executed before
+--   the others. This is very useful for applies.
+foldMapInXRebuildTree :: (Monad m)
+                  => (b -> Tree a -> m (b, Int))
+                  -> (b -> Tree a -> Tree a -> m (b, b))
+                  -> (b -> [Tree a] -> Tree a -> m (Tree a))
+                  -> b -> Tree a -> m (Tree a)
+foldMapInXRebuildTree _ _ allChF tdAcc n@(Node _ []) = allChF tdAcc [] n
+foldMapInXRebuildTree preChXF postChXF allChF tdAcc n@(Node _ ch) = do
+    (nChXAcc, numCh) <- preChXF tdAcc n
+    ncX              <- rcr nChXAcc $ ch!!numCh
+    (nAcc, chAcc)    <- postChXF nChXAcc ncX n
+    nRestCh          <- mapM (rcr chAcc) $ remove numCh ch
+    allChF nAcc (insert numCh ncX nRestCh) n
+
+  where rcr = foldMapInXRebuildTree preChXF postChXF allChF
+
+        remove _ [] = []
+        remove 0 (_:xs) = xs
+        remove i (x:xs) = x:remove (i-1) xs
+
+        insert 0 y [] = [y]
+        insert _ _ [] = []
+        insert 0 y xs = y:xs
+        insert i y (x:xs) = x:insert (i-1) y xs
+
+
 -- | Tree accumulation and reconstruction, with a priviliged first child accumulation.
 --   This function is useful for manipulating ASTs subject to bindings introduced by the first
 --   child, for example with let-ins, bind-as and case-of.
@@ -302,30 +352,3 @@ foldIn1RebuildTree preCh1F postCh1F mergeF allChF acc n@(Node _ ch) = do
           (cAcc, nc) <- rcr acc c
           nrAcc      <- mergeF rAcc cAcc
           return (nrAcc, chAcc++[nc])
-
--- | A mapping variant of foldIn1RebuildTree that threads a top-down accumulator
---   while reconstructing the tree.
--- preCh1F:  The pre-child function takes the top-down accumulator, the first child, and the node.
---           It returns a new accumulator
--- postCh1F: The post-child function takes the pre's accumulator, the processed first child, and the node.
---           It returns an accumulator, and a list of accumulators to be sent down while recursing
---           over the other children.
--- allChF:   The all-child function takes the post child's single accumulator, the processed children,
---           and the node, and returns a new tree.
-foldMapIn1RebuildTree :: (Monad m)
-                  => (b -> Tree a -> Tree a -> m b)
-                  -> (b -> Tree a -> Tree a -> m (b, [b]))
-                  -> (b -> [Tree a] -> Tree a -> m (Tree a))
-                  -> b -> Tree a -> m (Tree a)
-foldMapIn1RebuildTree _ _ allChF tdAcc n@(Node _ []) = allChF tdAcc [] n
-foldMapIn1RebuildTree preCh1F postCh1F allChF tdAcc n@(Node _ ch) = do
-    nCh1Acc        <- preCh1F tdAcc (head ch) n
-    nc1            <- rcr nCh1Acc $ head ch
-    (nAcc, chAccs) <- postCh1F nCh1Acc nc1 n
-    if length chAccs /= (length $ tail ch)
-      then fail "Invalid foldMapIn1RebuildTree accumulation"
-      else do
-        nRestCh <- zipWithM rcr chAccs $ tail ch
-        allChF nAcc (nc1:nRestCh) n
-
-  where rcr = foldMapIn1RebuildTree preCh1F postCh1F allChF
