@@ -1,5 +1,3 @@
-{-# LANGUAGE FlexibleInstances #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE PatternGuards #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE ViewPatterns #-}
@@ -19,11 +17,14 @@ module Language.K3.Analysis.HMTypes.Inference where
 import Control.Monad.Identity
 import Control.Monad.State
 import Control.Monad.Trans.Either
+import Control.Arrow (first, second)
 
 import Data.Function
 import Data.List
 import Data.Map ( Map )
 import qualified Data.Map as Map
+import Data.Set ( Set )
+import qualified Data.Set as Set
 import Data.Maybe
 import Data.Tree
 
@@ -77,49 +78,57 @@ qTypeOfM e = case e @~ isEQType of
               Just (EQType qt) -> return qt
               _ -> left $ "Untyped expression: " ++ show e
 
+-- Get only the values matching identifiers
 projectNamedPairs :: [Identifier] -> [(Identifier, a)] -> [a]
 projectNamedPairs ids idv = snd $ unzip $ filter (\(k,_) -> k `elem` ids) idv
 
+-- Replace matching values in newIds newVs if there's an id match
 rebuildNamedPairs :: [(Identifier, a)] -> [Identifier] -> [a] -> [a]
 rebuildNamedPairs oldIdv newIds newVs = map (replaceNewPair $ zip newIds newVs) oldIdv
   where replaceNewPair pairs (k,v) = maybe v id $ lookup k pairs
 
 
 -- | A type environment.
-type TEnv = [(Identifier, QPType)]
+type TEnv = Map Identifier (QPType, Maybe UID)
+
+-- | Annotation member environment.
+--   The boolean indicates whether the member is a lifted attribute.
+type TMEnv = Map Identifier (QPType, Bool)
 
 -- | Annotation type environment.
 type TAEnv = Map Identifier TMEnv
 
 -- | Declared type variable environment.
-type TDVEnv = [(Identifier, QTVarId)]
-
--- | Annotation member environment.
---   The boolean indicates whether the member is a lifted attribute.
-type TMEnv = [(Identifier, (QPType, Bool))]
+type TDVEnv = Map Identifier (QTVarId, Maybe UID)
 
 -- | A type variable environment.
+--   First member is the last assigned id
 data TVEnv = TVEnv QTVarId (Map QTVarId (K3 QType)) deriving Show
 
 -- | A type inference environment.
-type TIEnv = (TEnv, TAEnv, TDVEnv, TVEnv)
+data TIEnv = {
+               typeEnv :: TEnv,
+               annotEnv :: TAEnv,
+               declEnv :: TDVEnv,
+               tvarEnv :: TVEnv
+             }
 
 -- | The type inference monad
 type TInfM = EitherT String (State TIEnv)
 
 {- TEnv helpers -}
 tenv0 :: TEnv
-tenv0 = []
+tenv0 = Map.empty
 
-tlkup :: TEnv -> Identifier -> Either String QPType
-tlkup env x = maybe err Right $ lookup x env
+tlkup :: TEnv -> Identifier -> Either String (QPType, Maybe UID)
+tlkup env x = maybe err Right $ Map.lookup x env
  where err = Left $ "Unbound variable in type environment: " ++ x
 
-text :: TEnv -> Identifier -> QPType -> TEnv
-text env x t = (x,t) : env
+text :: TEnv -> Identifier -> QPType -> Maybe UID -> TEnv
+text env x t muid = Map.insert x (t, muid) env
 
 tdel :: TEnv -> Identifier -> TEnv
-tdel env x = deleteBy ((==) `on` fst) (x, QPType [] tint) env
+tdel env x = Map.delete x env
 
 
 {- TAEnv helpers -}
@@ -136,75 +145,64 @@ taext env x te = Map.insert x te env
 
 {- TDVEnv helpers -}
 tdvenv0 :: TDVEnv
-tdvenv0 = []
+tdvenv0 = Map.empty
 
-tdvlkup :: TDVEnv -> Identifier -> Either String (K3 QType)
-tdvlkup env x = maybe err (Right . tvar) $ lookup x env
+tdvlkup :: TDVEnv -> Identifier -> Either String (K3 QType, Maybe UID)
+tdvlkup env x = maybe err (first $ Right . tvar) $ Map.lookup x env
   where err = Left $ "Unbound declared variable in environment: " ++ x
 
 tdvext :: TDVEnv -> Identifier -> QTVarId -> TDVEnv
-tdvext env x v = (x,v) : env
+tdvext env x v muid = Map.insert x (v, muid) env
 
 tdvdel :: TDVEnv -> Identifier -> TDVEnv
-tdvdel env x = deleteBy ((==) `on` fst) (x,-1) env
+tdvdel env x = Map.delete x env
 
 {- TIEnv helpers -}
 tienv0 :: TIEnv
-tienv0 = (tenv0, taenv0, tdvenv0, tvenv0)
-
--- | Getters.
-tiee :: TIEnv -> TEnv
-tiee (te,_,_,_) = te
-
-tiae :: TIEnv -> TAEnv
-tiae (_,ta,_,_) = ta
-
-tidve :: TIEnv -> TDVEnv
-tidve (_,_,tdv,_) = tdv
-
-tive :: TIEnv -> TVEnv
-tive (_,_,_,tv) = tv
+tienv0 = TIEnv tenv0 taenv0 tdvenv0 tvenv0
 
 -- | Modifiers.
-mtiee :: (TEnv -> TEnv) -> TIEnv -> TIEnv
-mtiee f (te,x,y,z) = (f te, x, y, z)
+modTypeEnv :: (TEnv -> TEnv) -> TIEnv -> TIEnv
+modTypeEnv f env = env { typeEnv=f $ typeEnv env}
 
-mtiae :: (TAEnv -> TAEnv) -> TIEnv -> TIEnv
-mtiae f (x,ta,y,z) = (x, f ta, y, z)
+modAnnotEnv :: (TAEnv -> TAEnv) -> TIEnv -> TIEnv
+modAnnotEnv f env = env { annotEnv=f $ annotEnv env}
 
-mtidve :: (TDVEnv -> TDVEnv) -> TIEnv -> TIEnv
-mtidve f (x,y,tdv,z) = (x, y, f tdv, z)
+modDeclEnv :: (TDVEnv -> TDVEnv) -> TIEnv -> TIEnv
+modDeclEnv f env = env { declEnv=f $ declEnv env}
 
-mtive :: (TVEnv -> TVEnv) -> TIEnv -> TIEnv
-mtive f (x,y,z,tv) = (x, y, z, f tv)
+modTvarEnv :: (TVEnv -> TVEnv) -> TIEnv -> TIEnv
+modTvarEnv f env = env { tvarEnv=f $ tvarEnv env}
 
-tilkupe :: TIEnv -> Identifier -> Either String QPType
-tilkupe (te,_,_,_) x = tlkup te x
+tilkupe :: TIEnv -> Identifier -> Either String (QPType, Maybe UID)
+tilkupe env x = tlkup (typeEnv env) x
 
 tilkupa :: TIEnv -> Identifier -> Either String TMEnv
-tilkupa (_,ta,_,_) x = talkup ta x
+tilkupa env x = talkup (annotEnv env) x
 
-tilkupdv :: TIEnv -> Identifier -> Either String (K3 QType)
-tilkupdv (_,_,tdv,_) x = tdvlkup tdv x
+tilkupdv :: TIEnv -> Identifier -> Either String (K3 QType, Maybe UID)
+tilkupdv env x = tdvlkup (declEnv env) x
 
-tiexte :: TIEnv -> Identifier -> QPType -> TIEnv
-tiexte (te,ta,tdv,tv) x t = (text te x t, ta, tdv, tv)
+tiexte :: TIEnv -> Identifier -> QPType -> Maybe UID -> TIEnv
+tiexte env x t muid = env { typeEnv=text (typeEnv env) x t muid }
 
 tiexta :: TIEnv -> Identifier -> TMEnv -> TIEnv
 tiexta (te,ta,tdv,tv) x ate = (te, taext ta x ate, tdv, tv)
+tiexta env x ate = env { annotEnv=taext (annotEnv env) x ate }
 
-tiextdv :: TIEnv -> Identifier -> QTVarId -> TIEnv
+tiextdv :: TIEnv -> Identifier -> QTVarId -> Maybe UID -> TIEnv
 tiextdv (te, ta, tdv, tv) x v = (te, ta, tdvext tdv x v, tv)
+tiextdv env x v muid = env { declEnv=tdvext (declEnv env) x v muid }
 
 tidele :: TIEnv -> Identifier -> TIEnv
-tidele (te,x,y,z) i = (tdel te i,x,y,z)
+tidele env i = env {typeEnv=tdel (typeEnv te) i}
 
 tideldv :: TIEnv -> Identifier -> TIEnv
-tideldv (x,y,tdv,z) i = (x,y,tdvdel tdv i,z)
+tideldv env i = env {declEnv=tdvdel (declEnv env) i}
 
 tiincrv :: TIEnv -> (QTVarId, TIEnv)
-tiincrv (te, ta, tdv, TVEnv n s) = (n, (te, ta, tdv, TVEnv (succ n) s))
-
+tiincrv env = let TVEnv i m = tvarEnv env
+              in env {tvarEnv=TVEnv (i+1) m}
 
 {- TVEnv helpers -}
 tvenv0 :: TVEnv
@@ -216,16 +214,20 @@ tvlkup (TVEnv _ s) v = Map.lookup v s
 tvext :: TVEnv -> QTVarId -> K3 QType -> TVEnv
 tvext (TVEnv c s) v t = TVEnv c $ Map.insert v t s
 
+uniqIntersect :: [a] -> [b] -> [c]
+uniqIntersect a b = Set.fromList a `Set.intersect` Set.fromList b
+
 -- TVE domain predicate: check to see if a TVarName is in the domain of TVE
 tvdomainp :: TVEnv -> QTVarId -> Bool
 tvdomainp (TVEnv _ s) v = Map.member v s
 
--- Give the list of all type variables that are allocated in TVE but
+-- Give the set of all type variables that are allocated in TVE but
 -- not bound there
 tvfree :: TVEnv -> [QTVarId]
 tvfree (TVEnv c s) = filter (\v -> not (Map.member v s)) [0..c-1]
 
 -- `Shallow' substitution
+-- Find a type that's not a variable, or isn't bound
 tvchase :: TVEnv -> K3 QType -> K3 QType
 tvchase tve (tag -> QTVar v) | Just t <- tvlkup tve v = tvchase tve t
 tvchase _ t = t
@@ -238,24 +240,27 @@ tvchasev _ lastV tv = (lastV, tv)
 
 -- Compute (quite unoptimally) the characteristic function of the set
 --  forall tvb \in fv(tve_before). Union fv(tvsub(tve_after,tvb))
-tvdependentset :: TVEnv -> TVEnv -> (QTVarId -> Bool)
-tvdependentset tve_before tve_after =
+--  i.e. For all free vars in before_env, we check if any of them has the given
+--  var occurring free in them in the after_env
+tvDependentSet :: TVEnv -> TVEnv -> (QTVarId -> Bool)
+tvDependentSet tve_before tve_after =
     \tv -> any (\tvb -> occurs tv (tvar tvb) tve_after) tvbs
  where
    tvbs = tvfree tve_before
 
--- Return the list of type variables in t (possibly with duplicates)
-freevars :: K3 QType -> [QTVarId]
-freevars t = runIdentity $ foldMapTree extractVars [] t
+-- Return the set of type variables in t
+freeVars :: K3 QType -> Set QTVarId
+freeVars t = runIdentity $ foldMapTree extractVars Set.empty t
   where
-    extractVars _ (tag -> QTVar v) = return [v]
-    extractVars chAcc _ = return $ concat chAcc
+    extractVars _ (tag -> QTVar v) = return $ Set.singleton v
+    extractVars chAcc _ = return $ Set.unions chAcc
 
 -- The occurs check: if v appears free in t
+-- Either any of the children of t have v free, or the same QTVar is in t,
+-- or a QTVar in t links to v
 occurs :: QTVarId -> K3 QType -> TVEnv -> Bool
-occurs v t@(tag -> QTCon _)      tve = or $ map (flip (occurs v) tve) $ children t
-occurs v t@(tag -> QTOperator _) tve = or $ map (flip (occurs v) tve) $ children t
-occurs v (tag -> QTVar v2) tve
+occurs v t@(tag -> QTConst _) tve = or $ map (flip (occurs v) tve) $ children t
+occurs v   (tag -> QTVar v2) tve
   | v == v2   = True
   | otherwise = maybe (v == v2) (flip (occurs v) tve) $ tvlkup tve v2
 occurs _ _ _ = False
@@ -267,15 +272,19 @@ runTInfM :: TIEnv -> TInfM a -> (Either String a, TIEnv)
 runTInfM env m = flip runState env $ runEitherT m
 
 reasonM :: (String -> String) -> TInfM a -> TInfM a
-reasonM errf = mapEitherT $ \m -> m >>= \case
-  Left  err -> get >>= \env -> (return . Left $ errf $ err ++ "\nType environment:\n" ++ pretty env)
-  Right r   -> return $ Right r
+reasonM errf = mapEitherT $ \m -> do
+  res <- m
+  case res of
+    Left err -> do
+      env <- get 
+      return . Left . errf $ err ++ "\nType environment:\n" ++ pretty env
+    Right r -> return res
 
 liftEitherM :: Either String a -> TInfM a
 liftEitherM = either left return
 
 getTVE :: TInfM TVEnv
-getTVE = get >>= return . tive
+getTVE = get >>= return . tvarEnv
 
 -- Allocate a fresh type variable
 newtv :: TInfM (K3 QType)
@@ -284,26 +293,31 @@ newtv = do
   put nenv
   return $ tvar nv
 
-
 -- Deep substitute, throughout type structure
+-- Chase down every type var's pointers, and substitute for the var
 tvsub :: K3 QType -> TInfM (K3 QType)
 tvsub qt = mapTree sub qt
   where
-    sub ch t@(tag -> QTCon d) = return $ foldl (@+) (tdata d ch) $ annotations t
+    -- Gather all the gathered annotations from our children
+    sub ch t@(tag -> QTConst d) = return $ foldl (@+) (tdata d ch) $ annotations t
 
-    sub ch t@(tag -> QTOperator QTLower)
-      | null ch = left "Invalid qtype lower operator"
-      | null $ concatMap freevars ch = tvopeval QTLower ch >>= flip extendAnns t
-      | otherwise = return $ foldl (@+) (tlower ch) $ annotations t
+    -- We'll do this differently
+    -- sub ch t@(tag -> QTOperator QTLower)
+     --  | null ch = left "Invalid qtype lower operator"
+     --  | null $ concatMap freeVars ch = tvopeval QTLower ch >>= flip extendAnns t
+     --  | otherwise = return $ foldl (@+) (tlower ch) $ annotations t
 
-    sub _ t@(tag -> QTVar v) = getTVE >>= \tve ->
+    sub _ t@(tag -> QTVar v) = do
+      tve <- getTVE
       case tvlkup tve v of
         Just t' -> tvsub t' >>= flip extendAnns t
         _       -> return t
 
     sub _ t = return t
 
-    extendAnns t1 t2 = return $ foldl (@+) t1 $ annotations t2 \\ annotations t1
+    -- Add to t1 all the annotations of t2
+    extendAnns t1 t2 = return $ Set.foldl (@+) t1 $ annoSet t1 Set.\\ annoSet t2
+    annoSet t = Set.fromList $ annotations t
 
 -- | Lower bound computation for numeric and record types.
 --   This function does not preserve annotations.
@@ -317,16 +331,16 @@ tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
         | p1 == p2 -> return a'
 
       (QTCon (QTRecord i1), QTCon (QTRecord i2))
-        | i1 `intersect` i2 == i1 -> mergedRecord True  i1 a' i2 b'
-        | i1 `intersect` i2 == i2 -> mergedRecord False i2 b' i1 a'
+        | i1 `uniqIntersect` i2 == i1 -> mergedRecord True  i1 a' i2 b'
+        | i1 `uniqIntersect` i2 == i2 -> mergedRecord False i2 b' i1 a'
         | otherwise -> annLower a' b' >>= return . foldl (@+) (trec $ nub $ zip (i1 ++ i2) $ (children a') ++ (children b'))
 
       (QTCon (QTCollection _), QTCon (QTRecord _)) -> coveringCollection a' b'
       (QTCon (QTRecord _), QTCon (QTCollection _)) -> coveringCollection b' a'
 
       (QTCon (QTCollection idsA), QTCon (QTCollection idsB))
-        | idsA `intersect` idsB == idsA -> mergedCollection idsB a' b'
-        | idsA `intersect` idsB == idsB -> mergedCollection idsA a' b'
+        | idsA `uniqIntersect` idsB == idsA -> mergedCollection idsB a' b'
+        | idsA `uniqIntersect` idsB == idsB -> mergedCollection idsA a' b'
 
       (QTVar _, QTVar _) -> return a'
       (QTVar _, _) -> return a'
@@ -395,17 +409,21 @@ consistentTLower ch =
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
 --   a collection and a record that is a subtype of the collection.
+--   TODO: go over in more detail
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
-collectionSubRecord ct@(tag -> QTCon (QTCollection annIds)) (tag -> QTCon (QTRecord ids))
+collectionSubRecord ct@(tag -> QTConst (QTCollection annIds))
+                       (tag -> QTConst (QTRecord ids))
   = get >>= mkColQT >>= return . testF
   where
     mkColQT tienv = do
+      -- Get member environments for all annotations
       memEnvs <- mapM (liftEitherM . tilkupa tienv) annIds
       mkCollectionFSQType annIds memEnvs (last $ children ct)
 
+    -- Check that the created record matches the record ids
     testF (_, self)
-      | QTCon (QTRecord liftedAttrIds) <- tag self
-      , liftedAttrIds `intersect` ids == ids
+      | QTConst (QTRecord liftedAttrIds) <- tag self
+      , liftedAttrIds `uniqIntersect` ids == ids
       = Just (self, liftedAttrIds)
 
     testF _ = Nothing
@@ -416,11 +434,15 @@ collectionSubRecord _ _ = return Nothing
 unifyv :: QTVarId -> K3 QType -> TInfM ()
 unifyv v1 t@(tag -> QTVar v2)
   | v1 == v2  = return ()
-  | otherwise = trace (prettyTaggedSPair "unifyv var" v1 t) $ modify $ mtive $ \tve -> tvext tve v1 t
+  -- Since they're both free variables, make one point to the other?
+  -- What about if the second one already points to the first one?
+  | otherwise = trace (prettyTaggedSPair "unifyv var" v1 t) $
+      modify $ modTvarEnv $ \tve -> tvext tve v1 t
 
 unifyv v t = getTVE >>= \tve -> do
   if not $ occurs v t tve
-    then trace (prettyTaggedSPair "unifyv noc" v t) $ modify $ mtive $ \tve' -> tvext tve' v t
+    then trace (prettyTaggedSPair "unifyv noc" v t) $
+      modify $ modTvarEnv $ \tve' -> tvext tve' v t
     else tvsub t >>= unifyvMuQt tve
 
   where 
@@ -435,7 +457,8 @@ unifyv v t = getTVE >>= \tve -> do
 
     unifyvMuQt tve qt = do
       qt' <- injectSelfQt tve qt
-      trace (prettyTaggedSPair "unifyv yoc" v qt') $ modify $ mtive $ \tve' -> tvext tve' v qt'
+      trace (prettyTaggedSPair "unifyv yoc" v qt') $
+        modify $ modTvarEnv $ \tve' -> tvext tve' v qt'
 
     injectSelfQt tve qt = mapTree (inject tve) qt
     
@@ -460,25 +483,28 @@ unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> K3 QType -> K3 QType -> T
 unifyDrv preF postF qt1 qt2 = do
     (p1, qt1') <- preF qt1
     (p2, qt2') <- preF qt2
-    qt         <- trace (prettyTaggedPair "unifyDrv" qt1' qt2') $ unifyDrv' qt1' qt2'
+    qt         <- trace (prettyTaggedPair "unifyDrv" qt1' qt2') $
+                    unifyDrv' qt1' qt2'
     postF (p1, p2) qt
 
   where
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
     unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True) = tvlower t1 t2
 
-    unifyDrv' t1@(tag -> QTPrimitive p1) (tag -> QTPrimitive p2)
+    unifyDrv' t1@(tag -> QTPrimitive _ p1) (tag -> QTPrimitive _ p2)
       | p1 == p2  = return t1
-      | otherwise = primitiveErr p1 p2
+      | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
     -- | Self type unification
+    --   We don't know which collection self refers to
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
     -- | Record subtyping for projection
-    unifyDrv' t1@(tag -> QTCon d1@(QTRecord f1)) t2@(tag -> QTCon d2@(QTRecord f2))
-      | f1 `intersect` f2 == f1 = onRecord (t1,d1,f1) (t2,d2,f2)
-      | f1 `intersect` f2 == f2 = onRecord (t2,d2,f2) (t1,d1,f1)
+    unifyDrv' t1@(tag -> QTConst d1@(QTRecord f1)) 
+              t2@(tag -> QTConst d2@(QTRecord f2))
+      | f1 `uniqIntersect` f2 == f1 = onRecord (t1,d1,f1) (t2,d2,f2)
+      | f1 `uniqIntersect` f2 == f2 = onRecord (t2,d2,f2) (t1,d1,f1)
 
     -- | Collection-as-record subtyping for projection
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) t2@(tag -> QTCon (QTRecord _))
@@ -586,8 +612,18 @@ unifyDrv preF postF qt1 qt2 = do
 
     lowerBound t = tvopeval QTLower $ children t
 
-    primitiveErr a b = unifyErr a b "primitives" ""
-    unifyErr a b kind s = left $ unlines [unwords ["Unification mismatch on ", kind, "(", s, "):"], pretty a, pretty b]
+    -- Errors
+    primitiveErr a b annos = unifyErr a b "primitives" "" annos
+
+    unifyErr a b kind s annos = 
+      let uidAnnos = filter isQTUID annos in
+      left $ unlines [
+        unwords ["Unification mismatch on ", kind, "(", s, "):"], 
+        pretty a,
+        pretty b,
+        unwords $ "At uids: ":intersperse ", " $ map (show . getQTUID) annos
+      ]
+    
 
     subSelfErr ct = left $ boxToString $ ["Invalid self substitution, qtype is not a collection: "] ++ prettyLines ct
 
@@ -619,7 +655,7 @@ instantiate (QPType tvs t) = withFreshTVE $ do
   return $ Node (tg :@: filter (not . isQTQualified) anns) ch
  where
    wrapWithTVE tve_before tve_after m =
-    modify (mtive $ const tve_before) >> m >>= \r -> modify (mtive $ const tve_after) >> return r
+    modify (modTvarEnv $ const tve_before) >> m >>= \r -> modify (modTvarEnv $ const tve_after) >> return r
 
    withFreshTVE m = do
     ntve <- associate_with_freshvars tvs
@@ -643,8 +679,8 @@ generalize ta = do
  t          <- ta
  tve_after  <- getTVE
  t'         <- tvsub t
- let tvdep = tvdependentset tve_before tve_after
- let fv    = filter (not . tvdep) $ nub $ freevars t'
+ let tvdep = tvDependentSet tve_before tve_after
+ let fv    = filter (not . tvdep) $ nub $ freeVars t'
  return $ QPType fv t
  -- ^ We return an unsubstituted type to preserve type variables
  --   for late binding based on overriding unification performed
@@ -1222,7 +1258,6 @@ translateQType qt = mapTree translateWithMutability qt
           | QTFinal      <- tag qt' = return $ TC.builtIn TStructure
           | QTSelf       <- tag qt' = return $ TC.builtIn TSelf
           | QTVar v      <- tag qt' = return $ TC.declaredVar ("v" ++ show v)
-          | QTOperator _ <- tag qt' = Left $ "Invalid qtype translation for qtype operator"
 
         translate _ (tag -> QTPrimitive p) = case p of
           QTBool     -> return TC.bool

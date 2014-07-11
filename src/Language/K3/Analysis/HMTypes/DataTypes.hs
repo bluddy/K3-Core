@@ -8,6 +8,7 @@ module Language.K3.Analysis.HMTypes.DataTypes where
 
 import Data.List
 import Data.Tree
+import Data.Set
 
 import Language.K3.Core.Annotation
 import Language.K3.Core.Common
@@ -15,15 +16,14 @@ import Language.K3.Utils.Pretty
 
 type QTVarId = Int
 
-data QPType = QPType [QTVarId] (K3 QType)
+data QPType = QPType (Set QTVarId) (K3 QType)
                 deriving (Eq, Ord, Read, Show)
 
 data QType
         = QTBottom
-        | QTPrimitive QTBase
-        | QTCon       QTData
+        | QTPrimitive QTOpen QTBase 
+        | QTConst     QTData
         | QTVar       QTVarId
-        | QTOperator  QTOp
         | QTContent
         | QTFinal
         | QTSelf
@@ -43,25 +43,26 @@ data QTBase
         | QTNumber
       deriving (Enum, Eq, Ord, Read, Show)
 
+data QTContra = QTCovariant | QTContravariant
+data QTOpen = QTClosed | QTOpen QTContra
+
 data QTData
         = QTFunction
         | QTOption
         | QTIndirection
         | QTTuple
-        | QTRecord      [Identifier]
-        | QTCollection  [Identifier]
+        | QTRecord QTOpen [Identifier]
+        | QTCollection [Identifier]
         | QTTrigger
         | QTSource
         | QTSink
       deriving (Eq, Ord, Read, Show)
 
-data QTOp = QTLower deriving (Eq, Ord, Read, Show)
-
 -- | Annotations on types are the mutability qualifiers.
 data instance Annotation QType
     = QTMutable
     | QTImmutable
-    | QTWitness
+    | QTUID UID
   deriving (Eq, Ord, Read, Show)
 
 -- | Type constructors
@@ -69,7 +70,7 @@ tleaf :: QType -> K3 QType
 tleaf t = Node (t :@: []) []
 
 tdata :: QTData -> [K3 QType] -> K3 QType
-tdata d c = Node (QTCon d :@: []) c
+tdata d c = Node (QTConst d :@: []) c
 
 tprim :: QTBase -> K3 QType
 tprim b = tleaf $ QTPrimitive b
@@ -95,7 +96,7 @@ tself = tleaf QTSelf
 
 -- | Datatype constructors
 tfun :: K3 QType -> K3 QType -> K3 QType
-tfun a r = tdata QTFunction [a,r]
+tfun arg ret = tdata QTFunction [arg, ret]
 
 topt :: K3 QType -> K3 QType
 topt c = tdata QTOption [c]
@@ -106,8 +107,10 @@ tind c = tdata QTIndirection [c]
 ttup :: [K3 QType] -> K3 QType
 ttup c = tdata QTTuple c
 
-trec :: [(Identifier, K3 QType)] -> K3 QType
-trec idt = let (ids,ts) = unzip idt in tdata (QTRecord ids) ts
+trec :: QTOpen -> [(Identifier, K3 QType)] -> K3 QType
+trec open idt =
+  let (ids, ts) = unzip idt in
+  tdata (QTRecord open ids) ts
 
 tcol :: K3 QType -> [Identifier] -> K3 QType
 tcol ct annIds = tdata (QTCollection annIds) [ct]
@@ -148,30 +151,29 @@ tnum = tprim QTNumber
 tunit :: K3 QType
 tunit = ttup []
 
-
--- | Operator constructors
-tlower :: [K3 QType] -> K3 QType
-tlower ch = Node (QTOperator QTLower :@: []) $ nub ch
-
-
 -- | Annotation predicates
 isQTQualified :: Annotation QType -> Bool
 isQTQualified QTImmutable = True
 isQTQualified QTMutable   = True
 isQTQualified _ = False
 
+isQTUID :: Annotation QType -> Bool
+isQTUID (QTUID _) = True
+isQTUID _ = False
+
 isQTNumeric :: K3 QType -> Bool
-isQTNumeric (tag -> QTPrimitive p1) | p1 `elem` [QTInt, QTReal, QTNumber] = True
-                                    | otherwise = False
+isQTNumeric (tag -> QTPrimitive _ QTInt)    = True
+isQTNumeric (tag -> QTPrimitive _ QTReal)   = True
+isQTNumeric (tag -> QTPrimitive _ QTNumber) = True
 isQTNumeric _ = False
 
 isQTVar :: K3 QType -> Bool
 isQTVar (tag -> QTVar _) = True
 isQTVar _ = False
 
-isQTLower :: K3 QType -> Bool
-isQTLower (tag -> QTOperator QTLower) = True
-isQTLower _ = False
+getQTUID :: Annotation QType -> UID
+getQTUID (QTUID uid) = uid
+getQTUID _ = -1 
 
 instance Pretty QTVarId where
   prettyLines x = [show x]
