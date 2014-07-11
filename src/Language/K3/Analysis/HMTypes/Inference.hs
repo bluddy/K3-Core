@@ -99,11 +99,15 @@ type TMEnv = Map Identifier (QPType, Bool)
 type TAEnv = Map Identifier TMEnv
 
 -- | Declared type variable environment.
-type TDVEnv = Map Identifier (QTVarId, Maybe UID)
+--   (Alwyas has a varId)
+type TDVEnv = Map Identifier QTVarId
 
 -- | A type variable environment.
---   First member is the last assigned id
-data TVEnv = TVEnv QTVarId (Map QTVarId (K3 QType)) deriving Show
+--   1. the last assigned id
+--   2. map of id to type/other id
+--   3. map of id to uid
+data TVEnv = TVEnv QTVarId (Map QTVarId (K3 QType)) (Map QTVarID UID)
+       deriving Show
 
 -- | A type inference environment.
 data TIEnv = {
@@ -702,7 +706,7 @@ substituteDeepQt e = mapTree subNode e
 -- | Top-level type inference methods
 inferProgramTypes :: K3 Declaration -> Either String (K3 Declaration)
 inferProgramTypes prog = do
-    (_, initEnv) <- let (a,b) = runTInfM tienv0 $ initializeTypeEnv
+    (_, initEnv) <- let (a, b) = runTInfM tienv0 $ initializeTypeEnv
                     in a >>= return . (, b)
     nProg <- fst $ runTInfM initEnv $ mapProgram declF annMemF exprF prog
     return nProg

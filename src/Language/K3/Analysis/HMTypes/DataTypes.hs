@@ -16,7 +16,7 @@ import Language.K3.Utils.Pretty
 
 type QTVarId = Int
 
-data QPType = QPType (Set QTVarId) (K3 QType)
+data QPType = QPType [QTVarId] (K3 QType)
                 deriving (Eq, Ord, Read, Show)
 
 data QType
@@ -43,8 +43,8 @@ data QTBase
         | QTNumber
       deriving (Enum, Eq, Ord, Read, Show)
 
-data QTContra = QTCovariant | QTContravariant
-data QTOpen = QTClosed | QTOpen QTContra
+data QTCovar = QTCovar | QTContravar
+data QTOpen = QTClosed | QTOpen QTCovar
 
 data QTData
         = QTFunction
