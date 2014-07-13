@@ -19,9 +19,12 @@ type QTVarId = Int
 data QPType = QPType [QTVarId] (K3 QType)
                 deriving (Eq, Ord, Read, Show)
 
+data QTVariance = QTCovar | QTContra
+
 data QType
         = QTBottom
-        | QTPrimitive QTOpen QTBase 
+        | QTOpen      QTVariance QType
+        | QTPrimitive QTBase
         | QTConst     QTData
         | QTVar       QTVarId
         | QTContent
@@ -41,17 +44,23 @@ data QTBase
         | QTString
         | QTAddress
         | QTNumber
-      deriving (Enum, Eq, Ord, Read, Show)
+      deriving (Eq, Ord, Read, Show)
 
-data QTCovar = QTCovar | QTContravar
-data QTOpen = QTClosed | QTOpen QTCovar
+qtBaseEnum :: QTBase -> Int
+qtBaseEnum QTBool = 0
+qtBaseEnum QTByte = 1
+qtBaseEnum QTReal = 2
+qtBaseEnum QTInt = 3
+qtBaseEnum QTString = 4
+qtBaseEnum QTAddress = 5
+qtBaseEnum QTNumber = 6
 
 data QTData
         = QTFunction
         | QTOption
         | QTIndirection
         | QTTuple
-        | QTRecord QTOpen [Identifier]
+        | QTRecord [Identifier]
         | QTCollection [Identifier]
         | QTTrigger
         | QTSource
@@ -71,6 +80,15 @@ tleaf t = Node (t :@: []) []
 
 tdata :: QTData -> [K3 QType] -> K3 QType
 tdata d c = Node (QTConst d :@: []) c
+
+topen :: QTVariance -> K3 QType -> K3 QType
+topen var (Node (t :@: annos)) = Node (QTOpen var t :@: annos)
+
+topenco :: K3 QType -> K3 QType
+topenco = topen QTCovar
+
+topencontra :: K3 QType -> K3 QType
+topencontra = topen QTContra
 
 tprim :: QTBase -> K3 QType
 tprim b = tleaf $ QTPrimitive b
@@ -107,10 +125,10 @@ tind c = tdata QTIndirection [c]
 ttup :: [K3 QType] -> K3 QType
 ttup c = tdata QTTuple c
 
-trec :: QTOpen -> [(Identifier, K3 QType)] -> K3 QType
+trec :: QTVariance -> [(Identifier, K3 QType)] -> K3 QType
 trec open idt =
   let (ids, ts) = unzip idt in
-  tdata (QTRecord open ids) ts
+  Node (QTOpen open $ QTRecord ids) ts
 
 tcol :: K3 QType -> [Identifier] -> K3 QType
 tcol ct annIds = tdata (QTCollection annIds) [ct]
@@ -173,7 +191,7 @@ isQTVar _ = False
 
 getQTUID :: Annotation QType -> UID
 getQTUID (QTUID uid) = uid
-getQTUID _ = -1 
+getQTUID _ = -1
 
 instance Pretty QTVarId where
   prettyLines x = [show x]

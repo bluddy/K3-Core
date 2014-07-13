@@ -109,12 +109,18 @@ type TDVEnv = Map Identifier QTVarId
 data TVEnv = TVEnv QTVarId (Map QTVarId (K3 QType)) (Map QTVarID UID)
        deriving Show
 
+-- | A concretization environment
+--   Shows which types are applied to which other types, which must therefore
+--   be their subtypes. Concretization will use this as a shortcut.
+data TCEnv = TCEnv (Map QTVarId QTVarId)
+
 -- | A type inference environment.
 data TIEnv = {
                typeEnv :: TEnv,
                annotEnv :: TAEnv,
                declEnv :: TDVEnv,
-               tvarEnv :: TVEnv
+               tvarEnv :: TVEnv,
+               concEnv :: TCEnv
              }
 
 -- | The type inference monad
@@ -151,19 +157,29 @@ taext env x te = Map.insert x te env
 tdvenv0 :: TDVEnv
 tdvenv0 = Map.empty
 
-tdvlkup :: TDVEnv -> Identifier -> Either String (K3 QType, Maybe UID)
-tdvlkup env x = maybe err (first $ Right . tvar) $ Map.lookup x env
+tdvlkup :: TDVEnv -> Identifier -> Either String K3 QType
+tdvlkup env x = maybe err (Right . tvar) $ Map.lookup x env
   where err = Left $ "Unbound declared variable in environment: " ++ x
 
 tdvext :: TDVEnv -> Identifier -> QTVarId -> TDVEnv
-tdvext env x v muid = Map.insert x (v, muid) env
+tdvext env x v = Map.insert x v env
 
 tdvdel :: TDVEnv -> Identifier -> TDVEnv
 tdvdel env x = Map.delete x env
 
+{- TCEnv helpers -}
+tcenv0 :: TCEnv
+tcenv0 = Map.empty
+
+tclkup :: TCEnv -> QTVarId -> Maybe QTVarId
+tclkup env id = Map.lookup id env
+
+tclext :: TCEnv -> QTVarId -> QTVarId -> TCEnv
+tclext env id id' = Map.insert id id' env
+
 {- TIEnv helpers -}
 tienv0 :: TIEnv
-tienv0 = TIEnv tenv0 taenv0 tdvenv0 tvenv0
+tienv0 = TIEnv tenv0 taenv0 tdvenv0 tvenv0 tcenv0
 
 -- | Modifiers.
 modTypeEnv :: (TEnv -> TEnv) -> TIEnv -> TIEnv
