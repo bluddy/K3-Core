@@ -49,14 +49,23 @@ data QTBase
         | QTNumber
       deriving (Eq, Ord, Read, Show)
 
-qtBaseEnum :: QTBase -> Int
-qtBaseEnum QTBool = 0
-qtBaseEnum QTByte = 1
-qtBaseEnum QTReal = 2
-qtBaseEnum QTInt = 3
-qtBaseEnum QTString = 4
-qtBaseEnum QTAddress = 5
-qtBaseEnum QTNumber = 6
+qtEnumOfBase :: QTBase -> Int
+qtEnumOfBase QTBool    = 0
+qtEnumOfBase QTByte    = 1
+qtEnumOfBase QTReal    = 2
+qtEnumOfBase QTInt     = 3
+qtEnumOfBase QTString  = 4
+qtEnumOfBase QTAddress = 5
+qtEnumOfBase QTNumber  = 6
+
+qtBaseOfEnum :: QTBase -> Int
+qtBaseOfEnum 0 = QTBool
+qtBaseOfEnum 1 = QTByte
+qtBaseOfEnum 2 = QTReal
+qtBaseOfEnum 3 = QTInt
+qtBaseOfEnum 4 = QTString
+qtBaseOfEnum 5 = QTAddress
+qtBaseOfEnum 6 = QTNumber
 
 data QTData
         = QTFunction
@@ -64,7 +73,8 @@ data QTData
         | QTIndirection
         | QTTuple
         | QTRecord [Identifier]
-        | QTCollection [Identifier]
+          -- children: [element type, record of lifted attribs]
+        | QTCollection [Identifier] 
         | QTTrigger
         | QTSource
         | QTSink

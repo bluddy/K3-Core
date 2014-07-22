@@ -239,9 +239,12 @@ tvext (TVEnv c s u) v t = TVEnv c (IntMap.insert v t s) u
 tvextuid :: TVEnv -> QTVarId -> UID -> TVEnv
 tvextuid (TVEnv c s u) id' uid = TVEnv c s $ IntMap.insert id' uid env
 
-uniqIntersect :: [a] -> [b] -> [c]
+uniqIntersect :: [a] -> [a] -> [a]
 uniqIntersect a b = HashSet.toList $
   HashSet.fromList a `HashSet.intersect` HashSet.fromList b
+
+subSetOf :: [a] -> [a] -> Bool
+subSetOf a b = HashSet.fromList a `Hashset.intersect` HashSet.fromList b == HashSet.fromList a
 
 -- TVE domain predicate: check to see if a TVarName is in the domain of TVE
 tvdomainp :: TVEnv -> QTVarId -> Bool
@@ -328,12 +331,6 @@ tvsub qt = mapTree sub qt
     -- Gather all the gathered annotations from our children
     sub ch t@(tag -> QTConst d) = return $ foldl (@+) (tdata d ch) $ annotations t
 
-    -- We'll do this differently
-    -- sub ch t@(tag -> QTOperator QTLower)
-     --  | null ch = left "Invalid qtype lower operator"
-     --  | null $ concatMap freeVars ch = tvopeval QTLower ch >>= flip extendAnns t
-     --  | otherwise = return $ foldl (@+) (tlower ch) $ annotations t
-
     sub _ t@(tag -> QTVar v) = do
       tve <- getTVE
       case tvlkup tve v of
@@ -347,27 +344,37 @@ tvsub qt = mapTree sub qt
     annoSet t = Set.fromList $ annotations t
 
 -- | Lower bound computation for numeric and record types.
---   This function does not preserve annotations.
+--   Called by unify on nums and records
+--   This function does not preserve annotations.(NOTE: why?)
 tvlower :: K3 QType -> K3 QType -> TInfM (K3 QType)
 tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
   where
     tvlower' a' b' = case (tag a', tag b') of
       (QTPrimitive p1, QTPrimitive p2)
-        | [p1, p2] `intersect` [QTReal, QTInt, QTNumber] == [p1,p2] ->
-            annLower a' b' >>= return . foldl (@+) (tprim $ toEnum $ minimum $ map fromEnum [p1,p2])
+        | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] ->
+            -- Union of all annotations but mutability
+            annLower a' b' >>=
+            -- Find lowest common primitive type, and add combined annotations
+            return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
         | p1 == p2 -> return a'
 
+      -- Closed record types
       (QTCon (QTRecord i1), QTCon (QTRecord i2))
-        | i1 `uniqIntersect` i2 == i1 -> mergedRecord True  i1 a' i2 b'
-        | i1 `uniqIntersect` i2 == i2 -> mergedRecord False i2 b' i1 a'
-        | otherwise -> annLower a' b' >>= return . foldl (@+) (trec $ nub $ zip (i1 ++ i2) $ (children a') ++ (children b'))
+        | i1 `subsetOf` i2 -> mergedRecord True  i1 a' i2 b'
+        | i2 `subsetOf` i1 -> mergedRecord False i2 b' i1 a'
+        -- Neither one is a subset of the other
+        | otherwise ->
+            annLower a' b' >>=
+            -- Take the union. TODO: don't allow this.
+            -- Concrete records should never be any different
+            return . foldl (@+) (trec $ nub $ zip (i1 ++ i2) $ (children a') ++ (children b'))
 
       (QTCon (QTCollection _), QTCon (QTRecord _)) -> coveringCollection a' b'
       (QTCon (QTRecord _), QTCon (QTCollection _)) -> coveringCollection b' a'
 
       (QTCon (QTCollection idsA), QTCon (QTCollection idsB))
-        | idsA `uniqIntersect` idsB == idsA -> mergedCollection idsB a' b'
-        | idsA `uniqIntersect` idsB == idsB -> mergedCollection idsA a' b'
+        | idsA `subsetOf` idsB -> mergedCollection idsB a' b'
+        | idsB `subsetOf` idsA -> mergedCollection idsA a' b'
 
       (QTVar _, QTVar _) -> return a'
       (QTVar _, _) -> return a'
@@ -381,20 +388,32 @@ tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
 
         | otherwise -> lowerError a' b'
 
+    -- NOTE: Why does left/right matter?
     mergedRecord supAsLeft supid supqt subid subqt = do
       fieldQt <- mergeCovering supAsLeft
                   (zip supid $ children supqt) (zip subid $ children subqt)
-      annLower supqt subqt >>= return . foldl (@+) (trec $ zip subid fieldQt)
+      annLower supqt subqt >>= 
+        return . foldl (@+) (trec $ zip subid fieldQt)
 
     mergedCollection annIds ct1 ct2 = do
+       -- run tvlower on the record of the element type
        ctntLower <- tvlower (head $ children ct1) (head $ children ct2)
-       annLower ct1 ct2 >>= return . foldl (@+) (tcol ctntLower annIds)
+       annLower ct1 ct2 >>= 
+         return . foldl (@+) (tcol ctntLower annIds)
 
+    -- Merge supertype and subtype id/type lists for records
+    -- supAsLeft: call tvlower with superset on the left
+    -- Call tvlower on labels in common, keep labels that aren't as they are
+    -- NOTE: should be done only on open records
     mergeCovering supAsLeft sup sub =
       let lowerF = if supAsLeft then \subV supV -> tvlower supV subV
                                 else \subV supV -> tvlower subV supV
       in mapM (\(k,v) -> maybe (return v) (lowerF v) $ lookup k sup) sub
 
+    -- Merge collection and record that fits it
+    -- NOTE: this shouldn't be necessary. We can type as if collections
+    -- can contain anything, and then just remove the ones that don't have
+    -- records
     coveringCollection ct rt@(tag -> QTCon (QTRecord _)) =
       collectionSubRecord ct rt >>= \case
         Just _ -> return ct
@@ -402,6 +421,7 @@ tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
 
     coveringCollection x y = lowerError x y
 
+    -- Join annotations together for lower, except for mutability, which is invalid(?)
     annLower x@(annotations -> annA) y@(annotations -> annB) =
       let annAB   = nub $ annA ++ annB
           invalid = [QTMutable, QTImmutable]
@@ -413,19 +433,25 @@ tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
     lowerError x y = left $ unwords $ ["Invalid lower bound operands: ", show x, "and", show y]
 
 -- | Type operator evaluation.
+-- Run tvlower on list of types, getting the lower bound at each step
 tvopeval :: QTOp -> [K3 QType] -> TInfM (K3 QType)
 tvopeval _ [] = left $ "Invalid qt operator arguments"
 tvopeval QTLower ch = foldM tvlower (head ch) $ tail ch
 
+-- Run lower on direct types, then unify and lower type variables with them
+-- If we have only direct types, run lower on them
+-- If we have only typevars, unify amongst them first
 consistentTLower :: [K3 QType] -> TInfM (K3 QType)
 consistentTLower ch =
-    let (varCh, nonvarCh) = partition isQTVar $ nub ch in
-    case (varCh, nonvarCh) of
-      ([], []) -> left "Invalid lower qtype"
-      ([], _)  -> return $ tlower $ nonvarCh
-      (_, [])  -> getTVE >>= \tve -> unifiedLower (tail varCh) (tvchase tve $ head varCh)
-      (_, _)   -> tvopeval QTLower nonvarCh >>= unifiedLower varCh
+    case partition isQTVar $ nub ch of
+      ([], [])          -> left "Invalid lower qtype"
+      ([], nonvarCh)    -> return $ tlower $ nonvarCh
+      (varCh, [])       -> do
+        tve <- getTVE
+        unifiedLower (tail varCh) (tvchase tve $ head varCh)
+      (varCh, nonVarCh) -> tvopeval QTLower nonvarCh >>= unifiedLower varCh
   where
+    -- Run lower on type variables, after unifying with a real type
     unifiedLower vch lb = do
       void $ mapM_ (extractAndUnifyV lb) vch
       return $ tlower $ [lb]++vch
@@ -437,20 +463,23 @@ consistentTLower ch =
 -- | Returns a self record and lifted attribute identifiers when given
 --   a collection and a record that is a subtype of the collection.
 --   TODO: go over in more detail
+--   TODO: should really just extract member of collection, not assume record of collection
+--   Collections are also records because you can project on them (lifted attributes)
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
 collectionSubRecord ct@(tag -> QTConst (QTCollection annIds))
                        (tag -> QTConst (QTRecord ids))
   = get >>= mkColQT >>= return . testF
   where
     mkColQT tienv = do
-      -- Get member environments for all annotations
+      -- Get collection member environments for all annotations
       memEnvs <- mapM (liftEitherM . tilkupa tienv) annIds
+      -- Make final and self types
       mkCollectionFSQType annIds memEnvs (last $ children ct)
 
     -- Check that the created record matches the record ids
     testF (_, self)
       | QTConst (QTRecord liftedAttrIds) <- tag self
-      , liftedAttrIds `uniqIntersect` ids == ids
+      , ids `subsetOf` liftedAttrIds
       = Just (self, liftedAttrIds)
 
     testF _ = Nothing
@@ -461,27 +490,21 @@ collectionSubRecord _ _ = return Nothing
 unifyv :: QTVarId -> K3 QType -> TInfM ()
 unifyv v1 t@(tag -> QTVar v2)
   | v1 == v2  = return ()
-  -- Since they're both free variables, make one point to the other?
-  -- What about if the second one already points to the first one?
+
+    -- Since they're both variables make one point to the other.
   | otherwise = trace (prettyTaggedSPair "unifyv var" v1 t) $
       modify $ modTvarEnv $ \tve -> tvext tve v1 t
 
-unifyv v t = getTVE >>= \tve -> do
-  if not $ occurs v t tve
-    then trace (prettyTaggedSPair "unifyv noc" v t) $
+unifyv v t = do
+  tve <- getTVE
+  if not $ occurs v t tve then
+    -- just point the variable to the type
+    trace (prettyTaggedSPair "unifyv noc" v t) $
       modify $ modTvarEnv $ \tve' -> tvext tve' v t
-    else tvsub t >>= unifyvMuQt tve
+  else -- recursive type
+    tvsub t >>= unifyvMuQt tve
 
   where
-    {-
-    restrictedUnifyMu tve qt =
-      case tag qt of
-        QTCon (QTRecord _) -> unifyvMuQt tve qt
-        QTCon QTFunction   -> unifyvMuQt tve qt
-        QTOperator QTLower -> unifyvMuQt tve qt
-        _ -> left $ boxToString $ [unwords ["occurs check:", show v, "in "]] %+ prettyLines qt
-    -}
-
     unifyvMuQt tve qt = do
       qt' <- injectSelfQt tve qt
       trace (prettyTaggedSPair "unifyv yoc" v qt') $
@@ -675,7 +698,7 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $ 
 --   its occurrences in t with a fresh type variable. We do this by
 --   creating a substitution tve and applying it to t.
 --   We also strip any mutability qualifiers here since we only instantiate
---   on variable access. (Note: is this true?)
+--   on variable access. (NOTE: is this true?)
 instantiate :: QPType -> TInfM (K3 QType)
 instantiate (QPType tvs t) = withFreshTVE $ do
   Node (tg :@: anns) ch <- tvsub t
@@ -1170,6 +1193,7 @@ mkCollectionFSQType :: [Identifier] -> [TMEnv] -> K3 QType ->
                        TInfM (K3 QType, K3 QType)
 mkCollectionFSQType annIds memEnvs contentQt = do
     flatEnvs <- assertNoDuplicateIds
+    -- boolean determines if it's lifted
     let (lifted, regular) = partition (snd . snd) flatEnvs
     finalQt <- mkFinalQType contentQt regular
     selfQt  <- membersAsRecordFields lifted >>=
@@ -1189,14 +1213,13 @@ mkCollectionFSQType annIds memEnvs contentQt = do
     subCF _ _ ch      (Node t _) = return $ Node t ch
 
     assertNoDuplicateIds =
-      let flatEnvs = concat $ HashMap.toList memEnvs
+      let flatEnvs = concat $ map $ HashMap.toList memEnvs
           ids      = map fst flatEnvs
       in if nub ids /= ids then nameConflictErr else return flatEnvs
 
     -- NOTE: why do we instantiate here?
     membersAsRecordFields attrs =
-      mapM (\(j,(qpt,_)) ->
-        instantiate qpt >>= return . (j,)) attrs
+      mapM (\(j,(qpt,_)) -> instantiate qpt >>= return . (j,)) attrs
 
     nameConflictErr        =
       left $ "Conflicting annotation member names: " ++ show annIds
