@@ -21,10 +21,12 @@ import Control.Arrow (first, second)
 
 import Data.Function
 import Data.List
-import Data.Map ( Map )
-import qualified Data.Map as Map
-import Data.Set ( Set )
-import qualified Data.Set as Set
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
+import Data.HashMap (HashMap)
+import qualified Data.HashMap as HashMap
+import Data.HashSet (HashSet)
+import qualified Data.HashSet as HashSet
 import Data.Maybe
 import Data.Tree
 
@@ -89,30 +91,30 @@ rebuildNamedPairs oldIdv newIds newVs = map (replaceNewPair $ zip newIds newVs) 
 
 
 -- | A type environment.
-type TEnv = Map Identifier (QPType, Maybe UID)
+type TEnv = HashMap Identifier [(QPType, Maybe UID)]
 
 -- | Annotation member environment.
 --   The boolean indicates whether the member is a lifted attribute.
-type TMEnv = Map Identifier (QPType, Bool)
+type TMEnv = HashMap Identifier (QPType, Bool)
 
 -- | Annotation type environment.
-type TAEnv = Map Identifier TMEnv
+type TAEnv = HashMap Identifier TMEnv
 
 -- | Declared type variable environment.
 --   (Alwyas has a varId)
-type TDVEnv = Map Identifier QTVarId
+type TDVEnv = HashMap Identifier QTVarId
 
 -- | A type variable environment.
 --   1. the last assigned id
 --   2. map of id to type/other id
 --   3. map of id to uid
-data TVEnv = TVEnv QTVarId (Map QTVarId (K3 QType)) (Map QTVarID UID)
+data TVEnv = TVEnv QTVarId (IntMap QTVarId (K3 QType)) (IntMap QTVarID UID)
        deriving Show
 
 -- | A concretization environment
 --   Shows which types are applied to which other types, which must therefore
 --   be their subtypes. Concretization will use this as a shortcut.
-data TCEnv = TCEnv (Map QTVarId QTVarId)
+data TCEnv = TCEnv (IntMap QTVarId QTVarId)
 
 -- | A type inference environment.
 data TIEnv = {
@@ -128,54 +130,56 @@ type TInfM = EitherT String (State TIEnv)
 
 {- TEnv helpers -}
 tenv0 :: TEnv
-tenv0 = Map.empty
+tenv0 = HashMap.empty
 
 tlkup :: TEnv -> Identifier -> Either String (QPType, Maybe UID)
-tlkup env x = maybe err Right $ Map.lookup x env
+tlkup env x = maybe err (Right . head) $ HashMap.lookup x env
  where err = Left $ "Unbound variable in type environment: " ++ x
 
 text :: TEnv -> Identifier -> QPType -> Maybe UID -> TEnv
-text env x t muid = Map.insert x (t, muid) env
+text env x t muid = HashMap.insertWith (\l -> (t, muid):l) x [(t, muid)] env
 
 tdel :: TEnv -> Identifier -> TEnv
-tdel env x = Map.delete x env
+tdel env x = HashMap.update removeFront x env
+  where removeFront []   = Nothing
+        removeFront x:xs = Just xs
 
 
 {- TAEnv helpers -}
 taenv0 :: TAEnv
-taenv0 = Map.empty
+taenv0 = HashMap.empty
 
 talkup :: TAEnv -> Identifier -> Either String TMEnv
-talkup env x = maybe err Right $ Map.lookup x env
+talkup env x = maybe err Right $ HashMap.lookup x env
   where err = Left $ "Unbound variable in annotation environment: " ++ x
 
 taext :: TAEnv -> Identifier -> TMEnv -> TAEnv
-taext env x te = Map.insert x te env
+taext env x te = HashMap.insert x te env
 
 
 {- TDVEnv helpers -}
 tdvenv0 :: TDVEnv
-tdvenv0 = Map.empty
+tdvenv0 = HashMap.empty
 
 tdvlkup :: TDVEnv -> Identifier -> Either String K3 QType
-tdvlkup env x = maybe err (Right . tvar) $ Map.lookup x env
+tdvlkup env x = maybe err (Right . tvar) $ HashMap.lookup x env
   where err = Left $ "Unbound declared variable in environment: " ++ x
 
 tdvext :: TDVEnv -> Identifier -> QTVarId -> TDVEnv
-tdvext env x v = Map.insert x v env
+tdvext env x v = HashMap.insert x v env
 
 tdvdel :: TDVEnv -> Identifier -> TDVEnv
-tdvdel env x = Map.delete x env
+tdvdel env x = HashMap.delete x env
 
 {- TCEnv helpers -}
 tcenv0 :: TCEnv
-tcenv0 = Map.empty
+tcenv0 = IntMap.empty
 
 tclkup :: TCEnv -> QTVarId -> Maybe QTVarId
-tclkup env id = Map.lookup id env
+tclkup env id = IntMap.lookup id env
 
 tclext :: TCEnv -> QTVarId -> QTVarId -> TCEnv
-tclext env id id' = Map.insert id id' env
+tclext env id id' = IntMap.insert id id' env
 
 {- TIEnv helpers -}
 tienv0 :: TIEnv
@@ -207,11 +211,9 @@ tiexte :: TIEnv -> Identifier -> QPType -> Maybe UID -> TIEnv
 tiexte env x t muid = env { typeEnv=text (typeEnv env) x t muid }
 
 tiexta :: TIEnv -> Identifier -> TMEnv -> TIEnv
-tiexta (te,ta,tdv,tv) x ate = (te, taext ta x ate, tdv, tv)
 tiexta env x ate = env { annotEnv=taext (annotEnv env) x ate }
 
 tiextdv :: TIEnv -> Identifier -> QTVarId -> Maybe UID -> TIEnv
-tiextdv (te, ta, tdv, tv) x v = (te, ta, tdvext tdv x v, tv)
 tiextdv env x v muid = env { declEnv=tdvext (declEnv env) x v muid }
 
 tidele :: TIEnv -> Identifier -> TIEnv
@@ -221,30 +223,34 @@ tideldv :: TIEnv -> Identifier -> TIEnv
 tideldv env i = env {declEnv=tdvdel (declEnv env) i}
 
 tiincrv :: TIEnv -> (QTVarId, TIEnv)
-tiincrv env = let TVEnv i m = tvarEnv env
-              in env {tvarEnv=TVEnv (i+1) m}
+tiincrv env = let TVEnv i m u = tvarEnv env
+              in env {tvarEnv=TVEnv (i+1) m u}
 
 {- TVEnv helpers -}
 tvenv0 :: TVEnv
-tvenv0 = TVEnv 0 Map.empty
+tvenv0 = TVEnv 0 IntMap.empty IntMap.empty
 
 tvlkup :: TVEnv -> QTVarId -> Maybe (K3 QType)
-tvlkup (TVEnv _ s) v = Map.lookup v s
+tvlkup (TVEnv _ s _) v = IntMap.lookup v s
 
 tvext :: TVEnv -> QTVarId -> K3 QType -> TVEnv
-tvext (TVEnv c s) v t = TVEnv c $ Map.insert v t s
+tvext (TVEnv c s u) v t = TVEnv c (IntMap.insert v t s) u
+
+tvextuid :: TVEnv -> QTVarId -> UID -> TVEnv
+tvextuid (TVEnv c s u) id' uid = TVEnv c s $ IntMap.insert id' uid env
 
 uniqIntersect :: [a] -> [b] -> [c]
-uniqIntersect a b = Set.fromList a `Set.intersect` Set.fromList b
+uniqIntersect a b = HashSet.toList $
+  HashSet.fromList a `HashSet.intersect` HashSet.fromList b
 
 -- TVE domain predicate: check to see if a TVarName is in the domain of TVE
 tvdomainp :: TVEnv -> QTVarId -> Bool
-tvdomainp (TVEnv _ s) v = Map.member v s
+tvdomainp (TVEnv _ s _) v = IntMap.member v s
 
 -- Give the set of all type variables that are allocated in TVE but
 -- not bound there
 tvfree :: TVEnv -> [QTVarId]
-tvfree (TVEnv c s) = filter (\v -> not (Map.member v s)) [0..c-1]
+tvfree (TVEnv c s) = filter (\v -> not (IntMap.member v s)) [0..c-1]
 
 -- `Shallow' substitution
 -- Find a type that's not a variable, or isn't bound
@@ -296,7 +302,7 @@ reasonM errf = mapEitherT $ \m -> do
   res <- m
   case res of
     Left err -> do
-      env <- get 
+      env <- get
       return . Left . errf $ err ++ "\nType environment:\n" ++ pretty env
     Right r -> return res
 
@@ -309,7 +315,8 @@ getTVE = get >>= return . tvarEnv
 -- Allocate a fresh type variable
 newtv :: TInfM (K3 QType)
 newtv = do
-  (nv, nenv) <- get >>= return . tiincrv
+  env <- get
+  let (nv, nenv) = tiincrv env
   put nenv
   return $ tvar nv
 
@@ -465,9 +472,9 @@ unifyv v t = getTVE >>= \tve -> do
       modify $ modTvarEnv $ \tve' -> tvext tve' v t
     else tvsub t >>= unifyvMuQt tve
 
-  where 
+  where
     {-
-    restrictedUnifyMu tve qt = 
+    restrictedUnifyMu tve qt =
       case tag qt of
         QTCon (QTRecord _) -> unifyvMuQt tve qt
         QTCon QTFunction   -> unifyvMuQt tve qt
@@ -481,11 +488,11 @@ unifyv v t = getTVE >>= \tve -> do
         modify $ modTvarEnv $ \tve' -> tvext tve' v qt'
 
     injectSelfQt tve qt = mapTree (inject tve) qt
-    
+
     inject tve nch n@(Node (QTCon (QTRecord _) :@: anns) _)
       | occurs v n tve = return $ foldl (@+) tself anns
       | otherwise = return $ Node (tag n :@: anns) nch
-    
+
     inject _ [(tag -> QTSelf)] (Node (QTOperator QTLower :@: anns) [Node (QTCon (QTRecord _) :@: _) _])
       = return $ foldl (@+) tself anns
 
@@ -521,7 +528,7 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
     -- | Record subtyping for projection
-    unifyDrv' t1@(tag -> QTConst d1@(QTRecord f1)) 
+    unifyDrv' t1@(tag -> QTConst d1@(QTRecord f1))
               t2@(tag -> QTConst d2@(QTRecord f2))
       | f1 `uniqIntersect` f2 == f1 = onRecord (t1,d1,f1) (t2,d2,f2)
       | f1 `uniqIntersect` f2 == f2 = onRecord (t2,d2,f2) (t1,d1,f1)
@@ -635,15 +642,15 @@ unifyDrv preF postF qt1 qt2 = do
     -- Errors
     primitiveErr a b annos = unifyErr a b "primitives" "" annos
 
-    unifyErr a b kind s annos = 
+    unifyErr a b kind s annos =
       let uidAnnos = filter isQTUID annos in
       left $ unlines [
-        unwords ["Unification mismatch on ", kind, "(", s, "):"], 
+        unwords ["Unification mismatch on ", kind, "(", s, "):"],
         pretty a,
         pretty b,
         unwords $ "At uids: ":intersperse ", " $ map (show . getQTUID) annos
       ]
-    
+
 
     subSelfErr ct = left $ boxToString $ ["Invalid self substitution, qtype is not a collection: "] ++ prettyLines ct
 
@@ -668,25 +675,31 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $ 
 --   its occurrences in t with a fresh type variable. We do this by
 --   creating a substitution tve and applying it to t.
 --   We also strip any mutability qualifiers here since we only instantiate
---   on variable access.
+--   on variable access. (Note: is this true?)
 instantiate :: QPType -> TInfM (K3 QType)
 instantiate (QPType tvs t) = withFreshTVE $ do
-  (Node (tg :@: anns) ch) <- tvsub t
+  Node (tg :@: anns) ch <- tvsub t
   return $ Node (tg :@: filter (not . isQTQualified) anns) ch
  where
-   wrapWithTVE tve_before tve_after m =
-    modify (modTvarEnv $ const tve_before) >> m >>= \r -> modify (modTvarEnv $ const tve_after) >> return r
-
+   -- Generate fresh vars, run the action with the new, and restore the old
    withFreshTVE m = do
-    ntve <- associate_with_freshvars tvs
-    otve <- getTVE
-    wrapWithTVE ntve otve m
+    newtve <- associateWithFreshvars tvs
+    oldtve <- getTVE
+    wrapWithTVE newtve oldtve m
 
-   associate_with_freshvars [] = return tvenv0
-   associate_with_freshvars (tv:rtvs) = do
-     tve     <- associate_with_freshvars rtvs
-     tvfresh <- newtv
-     return $ tvext tve tv tvfresh
+   -- Run an action with a before- and after- var environment
+   wrapWithTVE tveBefore tveAfter m = do
+    modify (modTvarEnv $ const tveBefore)
+    r <- m
+    modify (modTvarEnv $ const tveAfter)
+    return r
+
+   -- Add fresh varIds for all existing varids
+   associateWithFreshvars tvs = foldlM addFreshVar (return tvenv0) tvs
+     where
+       addFreshVar acc tv = do
+         tvfresh <- newtv
+         return $ tvext acc tv tvfresh
 
 -- | Return a monomorphic polytype.
 monomorphize :: (Monad m) => K3 QType -> m QPType
@@ -722,6 +735,7 @@ substituteDeepQt e = mapTree subNode e
 -- | Top-level type inference methods
 inferProgramTypes :: K3 Declaration -> Either String (K3 Declaration)
 inferProgramTypes prog = do
+    -- Prepare the initial type environment
     (_, initEnv) <- let (a, b) = runTInfM tienv0 $ initializeTypeEnv
                     in a >>= return . (, b)
     nProg <- fst $ runTInfM initEnv $ mapProgram declF annMemF exprF prog
@@ -730,35 +744,56 @@ inferProgramTypes prog = do
     initializeTypeEnv :: TInfM (K3 Declaration)
     initializeTypeEnv = mapProgram initDeclF initAMemF initExprF prog
 
-    withUnique :: Identifier -> TInfM (K3 Declaration) -> TInfM (K3 Declaration)
-    withUnique n m = failOnValid (return ()) (uniqueErr "declaration" n) (flip tilkupe n) >>= const m
+    -- Make sure certain identifiers don't already exist in the environment
+    withUnique' :: (TIEnv -> a) -> String -> Identifier ->
+                   TInfM (K3 Declaration) -> TInfM (K3 Declaration)
+    withUnique' lookupF s n m = failOnValid (return ()) (uniqueErr s n)
+                       (flip lookupF n) >>= const m
 
-    withUniqueA :: Identifier -> TInfM (K3 Declaration) -> TInfM (K3 Declaration)
-    withUniqueA n m = failOnValid (return ()) (uniqueErr "annotation" n) (flip tilkupa n) >>= const m
+    withUnique n m  = withUnique' tilkupe "declaration"
+    withUniqueA n m = withUnique' tilkupa "annotation"
 
+    -- Fail on a successful application of a function
     failOnValid :: TInfM () -> TInfM () -> (TIEnv -> Either a b) -> TInfM ()
-    failOnValid success failure f = get >>= \env -> either (const $ success) (const $ failure) $ f env
+    failOnValid success failure f = do
+      tienv <- get
+      either (const $ success) (const $ failure) $ f tienv
 
     uniqueErr :: String -> Identifier -> TInfM a
     uniqueErr s n = left $ unwords ["Invalid unique", s, "identifier:", n]
 
+    -- Create an initial declaration environment for recursive scope
     initDeclF :: K3 Declaration -> TInfM (K3 Declaration)
     initDeclF d@(tag -> DGlobal n t _)
-      | isTFunction t = withUnique n $ qpType t >>= \qpt -> modify (\env -> tiexte env n qpt) >> return d
+      | isTFunction t = withUnique n $ do
+          qpt <- qpType t
+          modify (\env -> tiexte env n qpt)
+          return d
       | otherwise     = return d
 
     initDeclF d@(tag -> DTrigger n t _) =
-      withUnique n $ trigType t >>= \qpt -> modify (\env -> tiexte env n qpt) >> return d
-      where trigType x = qType x >>= \qt -> return (ttrg qt) >>= monomorphize
+      withUnique n $ do
+        qpt <- trigType t
+        modify (\env -> tiexte env n qpt)
+        return d
+      where trigType x = do
+        qt <- qType x
+        monomorphize $ ttrg qt
 
-    initDeclF d@(tag -> DAnnotation n tdeclvars mems) = withUniqueA n $ mkAnnMemEnv >> return d
-      where mkAnnMemEnv = mapM memType mems >>= \l -> modify (\env -> tiexta env n $ catMaybes l)
-            memType (Lifted      _ mn mt _ _) = unifyMemInit True  mn mt
-            memType (Attribute   _ mn mt _ _) = unifyMemInit False mn mt
-            memType (MAnnotation _ _ _) = return Nothing
-            unifyMemInit lifted mn mt = do
-              qpt <- qpType (TC.forAll tdeclvars mt)
-              return (Just (mn, (qpt, lifted)))
+    initDeclF d@(tag -> DAnnotation n tdeclvars mems) =
+      withUniqueA n $ mkAnnMemEnv >> return d
+      where mkAnnMemEnv = do
+              l <- mapM memType mems
+              modify $ \env ->
+                tiexta env n $ HashMap.fromList catMaybes l
+
+            memType (Lifted      _ nm typ _ _) = unifyMemInit True  nm typ
+            memType (Attribute   _ nm typ _ _) = unifyMemInit False nm typ
+            memType (MAnnotation _ _ _)       = return Nothing
+
+            unifyMemInit lifted nm typ = do
+              qpt <- qpType $ TC.forAll tdeclvars typ
+              return $ Just (nm, (qpt, lifted))
 
     initDeclF d = return d
 
@@ -830,7 +865,7 @@ inferProgramTypes prog = do
     mkErrorF :: K3 Expression -> (String -> String) -> (String -> String)
     mkErrorF e f s = spanAsString ++ f s
       where spanAsString = let spans = mapMaybe getSpan $ annotations e
-                           in if null spans 
+                           in if null spans
                                 then (boxToString $ ["["] %+ prettyLines e %+ ["]"])
                                 else unwords ["[", show $ head spans, "] "]
 
@@ -838,9 +873,9 @@ inferProgramTypes prog = do
     trigTypeErr   n = left $ "Invlaid trigger declaration type for: " ++ n
     unifyInitErrF s = "Failed to unify initializer: " ++ s
 
--- | Expression type inference. Note this not perform a final type substitution, leaving
---   it to the caller as desired. This may leave type variables present in the
---   quicktype annotations attached to expressions.
+-- | Expression type inference. Note this not perform a final type substitution,
+--   leaving it to the caller as desired. This may leave type variables present
+--   in the quicktype annotations attached to expressions.
 inferExprTypes :: K3 Expression -> TInfM (K3 Expression)
 inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType expr
 
@@ -908,14 +943,16 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     inferQType _ n@(tag -> EConstant (CNone nm)) = do
       tv <- newtv
-      let ntv = case nm of { NoneMut -> mutQT tv; NoneImmut -> immutQT tv }
+      let ntv = case nm of
+                  NoneMut   -> mutQT tv
+                  NoneImmut -> immutQT tv
       return $ n .+ (topt ntv)
 
     inferQType _ n@(tag -> EConstant (CEmpty t)) = do
-        cqt <- qType t
-        let annIds =  namedEAnnotations $ annotations n
-        colqt <- mkCollectionQType annIds cqt
-        return $ n .+ colqt
+      cqt <- qType t
+      let annIds =  namedEAnnotations $ annotations n
+      colqt <- mkCollectionQType annIds cqt
+      return $ n .+ colqt
 
     -- | Variable specialization. Note that instantiate strips qualifiers.
     inferQType _ n@(tag -> EVariable i) = do
@@ -942,35 +979,41 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     -- | Assignment expressions unify their source and target types, as well as
     --   ensuring that the source is mutable.
-    inferQType ch n@(tag -> EAssign i) = do
+    inferQType ch n@(tag -> EAssign id') = do
       env <- get
-      ipt <- either (assignBindingErr i) return $ tilkupe env i
+      (ipt, muid) <- either (assignBindingErr i) return $ tilkupe env id'
       eqt <- qTypeOfM $ head ch
       case ipt of
-        QPType [] iqt
-          | (iqt @~ isQTQualified) == Just QTMutable ->
-              do { void $ unifyM (iqt @- QTMutable) eqt $ mkErrorF n (("Invalid assignment to " ++ i ++ ": ") ++);
-                   return $ rebuildE n ch .+ tunit }
+        QPType [] iqt -- monomorphic
+          | (iqt @~ isQTQualified) == Just QTMutable -> do
+              void $ unifyM (iqt @- QTMutable) eqt $
+                mkErrorF n (("Invalid assignment to " ++ i ++ ": ") ++)
+              return $ rebuildE n ch .+ tunit
           | otherwise -> mutabilityErr i
 
         _ -> polyAssignBindingErr
 
-    inferQType ch n@(tag -> EProject i) = do
+    inferQType ch n@(tag -> EProject id') = do
       srcqt   <- qTypeOfM $ head ch
       fieldqt <- newtv
-      let prjqt = tlower $ [trec [(i, fieldqt)]]
-      void    $  trace (prettyTaggedPair ("infer prj " ++ i) srcqt prjqt)
-              $    unifyM srcqt prjqt $ mkErrorF n ((unlines ["Invalid record projection:", pretty srcqt, "and", pretty prjqt]) ++)
-      return  $  rebuildE n ch .+ fieldqt
+      let prjqt = topenrec QTCovar $ [trec [(i, fieldqt)]]
+      void $ trace (prettyTaggedPair ("infer prj " ++ id') srcqt prjqt)
+           $ unifyM srcqt prjqt $ mkErrorF n
+             ((unlines ["Invalid record projection:", pretty srcqt, "and", pretty prjqt]) ++)
+      return $ rebuildE n ch .+ fieldqt
 
     -- TODO: reorder inferred record fields based on argument at application.
     inferQType ch n@(tag -> EOperate OApp) = do
       fnqt   <- qTypeOfM $ head ch
       argqt  <- qTypeOfM $ last ch
       retqt  <- newtv
-      let errf = mkErrorF n (unlines ["Invalid function application:", pretty fnqt, "and", pretty (tfun argqt retqt), ":"] ++)
-      void   $  trace (prettyTaggedTriple "infer app " n fnqt $ tfun argqt retqt) $ unifyWithOverrideM fnqt (tfun argqt retqt) errf
-      return $  rebuildE n ch .+ retqt
+      let errf = mkErrorF n (unlines ["Invalid function application:",
+                                       pretty fnqt,
+                                       "and",
+                                       pretty (tfun argqt retqt), ":"] ++)
+      void $ trace (prettyTaggedTriple "infer app " n fnqt $ tfun argqt retqt) $
+        unifyWithOverrideM fnqt (tfun argqt retqt) errf
+      return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EOperate OSeq) = do
         lqt <- qTypeOfM $ head ch
@@ -1022,7 +1065,8 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       where
         delayNumericQt l r
           | or (map isQTVar   [l, r]) = return $ tlower [l,r]
-          | or (map isQTLower [l, r]) = return $ tlower $ concatMap childrenOrSelf [l,r]
+          | or (map isQTLower [l, r]) = return $ tlower $
+                                          concatMap childrenOrSelf [l,r]
           | otherwise = tvlower l r
 
         childrenOrSelf t@(tag -> QTOperator QTLower) = children t
@@ -1107,38 +1151,57 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
 {- Collection type construction -}
 
+-- Only allow record contents in this version of the type system
+-- Make a collection qtype into the equivalent record
 mkCollectionQType :: [Identifier] -> K3 QType -> TInfM (K3 QType)
-mkCollectionQType annIds contentQt@(tag -> QTCon (QTRecord _)) = return $ tcol contentQt annIds
+mkCollectionQType annIds contentQt@(tag -> QTCon (QTRecord _)) =
+  return $ tcol contentQt annIds
+mkCollectionQType annIds contentQt@(tag -> QTOpen _ (QTCon (QTRecord _))) =
+  return $ tcol contentQt annIds
+
 mkCollectionQType _ qt = left $ "Invalid content record type: " ++ show qt
 
-mkCollectionFSQType :: [Identifier] -> [TMEnv] -> K3 QType -> TInfM (K3 QType, K3 QType)
+
+-- Make the final and self types of a collection
+-- (with possibly many annotations)
+-- Takes annotation names, annotation member environments, content qtype
+-- Returns final and self types
+mkCollectionFSQType :: [Identifier] -> [TMEnv] -> K3 QType ->
+                       TInfM (K3 QType, K3 QType)
 mkCollectionFSQType annIds memEnvs contentQt = do
     flatEnvs <- assertNoDuplicateIds
     let (lifted, regular) = partition (snd . snd) flatEnvs
     finalQt <- mkFinalQType contentQt regular
-    selfQt  <- membersAsRecordFields lifted >>= subCTVars contentQt finalQt . trec
+    selfQt  <- membersAsRecordFields lifted >>=
+               subCTVars contentQt finalQt . trec
     return (finalQt, selfQt)
   where
-    mkFinalQType cqt regular =
-      case tag cqt of
+    mkFinalQType conQt regular =
+      case tag conQt of
         QTCon (QTRecord ids) ->
-           membersAsRecordFields regular >>= return . trec . ((zip ids $ children cqt) ++)
-        _ -> nonRecordContentErr cqt
+           membersAsRecordFields regular >>=
+             return . trec . ((zip ids $ children conQt) ++)
+        _ -> nonRecordContentErr conQt
 
-    subCTVars ct ft st = mapTree (subCF ct ft) st
-    subCF ct _ _ (tag -> QTContent) = return ct
-    subCF _ ft _ (tag -> QTFinal)   = return ft
-    subCF _ _ ch (Node t _) = return $ Node t ch
+    subCTVars content finalt st = mapTree (subCF content finalt) st
+    subCF content _ _ (tag -> QTContent) = return content
+    subCF _ finalt _  (tag -> QTFinal)   = return finalt
+    subCF _ _ ch      (Node t _) = return $ Node t ch
 
     assertNoDuplicateIds =
-      let flatEnvs = concat memEnvs
+      let flatEnvs = concat $ HashMap.toList memEnvs
           ids      = map fst flatEnvs
       in if nub ids /= ids then nameConflictErr else return flatEnvs
 
-    membersAsRecordFields attrs = mapM (\(j,(qpt,_)) -> instantiate qpt >>= return . (j,)) attrs
+    -- NOTE: why do we instantiate here?
+    membersAsRecordFields attrs =
+      mapM (\(j,(qpt,_)) ->
+        instantiate qpt >>= return . (j,)) attrs
 
-    nameConflictErr        = left $ "Conflicting annotation member names: " ++ show annIds
-    nonRecordContentErr qt = left $ "Invalid content record type: " ++ show qt
+    nameConflictErr        =
+      left $ "Conflicting annotation member names: " ++ show annIds
+    nonRecordContentErr qt =
+      left $ "Invalid content record type: " ++ show qt
 
 
 {- Type conversion -}
@@ -1149,13 +1212,19 @@ qpType :: K3 Type -> TInfM QPType
 --   environment with fresh qtype variables. This leads to substitutions for any
 --   corresponding declared variables in the type tree.
 qpType t@(tag -> TForall tvars) = do
-  tvmap <- mapM (\(TypeVarDecl i _ _) -> newtv >>= varId >>= return . (i,)) tvars
+  -- Create varIds for all the forall variables
+  tvmap <- mapM idToNewVarId $ map (\(TypeVarDecl id' _ _) -> id') tvars
+  -- Add and then delete the temporary forall identifiers
   void $ modify $ extend tvmap
   chQt <- qType (head $ children t)
   void $ modify $ prune tvmap
   return $ QPType (map snd tvmap) chQt
 
   where
+    idToNewVarId id' = do
+      v <- newtv
+      vId <- varId v
+      return (id', vId)
     extend tvmap env = foldl (\a (b,c) -> tiextdv a b c) env tvmap
     prune  tvmap env = foldl (\a (b,_) -> tideldv a b) env tvmap
     varId (tag -> QTVar i) = return i
@@ -1204,7 +1273,9 @@ qType t = foldMapTree mkQType (ttup []) t >>= return . mutabilityT t
     mkQType _ (tag -> TBuiltIn TStructure) = return tfinal
     mkQType _ (tag -> TBuiltIn TSelf)      = return tself
 
-    mkQType _ (tag -> TDeclaredVar x) = get >>= \tienv -> liftEitherM (tilkupdv tienv x)
+    mkQType _ (tag -> TDeclaredVar x) = do
+      tienv <- get
+      liftEitherM (tilkupdv tienv x)
 
     mkQType _ (tag -> TForall _) = left $ "Invalid forall type for QType"
       -- ^ TODO: we can only handle top-level foralls, and not arbitrary
@@ -1304,7 +1375,7 @@ translateQType qt = mapTree translateWithMutability qt
 
 {- Instances -}
 instance Pretty TIEnv where
-  prettyLines (te, ta, tdv, tve) = 
+  prettyLines (te, ta, tdv, tve) =
     ["TEnv: "]   %$ (indent 2 $ prettyLines te)  ++
     ["TAEnv: "]  %$ (indent 2 $ prettyLines ta)  ++
     ["TDVEnv: "] %$ (indent 2 $ prettyLines tdv) ++

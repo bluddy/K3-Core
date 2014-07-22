@@ -16,6 +16,9 @@ import Language.K3.Utils.Pretty
 
 type QTVarId = Int
 
+-- Polymorphic type
+-- 1. All polymorphic vars in the type
+-- 2. Type
 data QPType = QPType [QTVarId] (K3 QType)
                 deriving (Eq, Ord, Read, Show)
 
@@ -125,8 +128,13 @@ tind c = tdata QTIndirection [c]
 ttup :: [K3 QType] -> K3 QType
 ttup c = tdata QTTuple c
 
-trec :: QTVariance -> [(Identifier, K3 QType)] -> K3 QType
-trec open idt =
+trec :: [(Identifier, K3 QType)] -> K3 QType
+trec idt =
+  let (ids, ts) = unzip idt in
+  Node (QTRecord ids) ts
+
+topenrec :: QTVariance -> [(Identifier, K3 QType)] -> K3 QType
+topenrec open idt =
   let (ids, ts) = unzip idt in
   Node (QTOpen open $ QTRecord ids) ts
 
