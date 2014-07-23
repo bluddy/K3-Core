@@ -32,6 +32,7 @@ data QType
         | QTVar       QTVarId
         | QTContent
         | QTFinal
+          -- Self type is a recursive collection type.
         | QTSelf
         | QTTop
       deriving (Eq, Ord, Read, Show)
@@ -73,12 +74,25 @@ data QTData
         | QTIndirection
         | QTTuple
         | QTRecord [Identifier]
-          -- children: [element type, record of lifted attribs]
-        | QTCollection [Identifier] 
+        | QTCollection [Identifier]
+          -- child is element type
         | QTTrigger
         | QTSource
         | QTSink
-      deriving (Eq, Ord, Read, Show)
+      deriving (Ord, Read, Show)
+
+-- Make records and collections equal independent of id order
+instance Eq QTData where
+  QTFunction         == QTFunction          = True
+  QTOption           == QTOption            = True
+  QTIndirection      == QTIndirection       = True
+  QTTuple            == QTTuple             = True
+  (QTRecord ids)     == (QTRecord ids')     = HashSet.fromList ids == HashSet.fromList ids'
+  (QTCollection ids) == (QTCollection ids') = HashSet.fromList ids == HashSet.fromList ids'
+  QTTrigger          == QTTrigger           = True
+  QTSource           == QTSource            = True
+  QTSink             == QTSink              = True
+  _                  == _                   = False
 
 -- | Annotations on types are the mutability qualifiers.
 data instance Annotation QType

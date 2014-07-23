@@ -80,7 +80,7 @@ qTypeOfM e = case e @~ isEQType of
               Just (EQType qt) -> return qt
               _ -> left $ "Untyped expression: " ++ show e
 
--- Get only the values matching identifiers
+-- Get only the values matching keys among identifiers
 projectNamedPairs :: [Identifier] -> [(Identifier, a)] -> [a]
 projectNamedPairs ids idv = snd $ unzip $ filter (\(k,_) -> k `elem` ids) idv
 
@@ -421,11 +421,11 @@ tvlower a b = getTVE >>= \tve -> tvlower' (tvchase tve a) (tvchase tve b)
 
     coveringCollection x y = lowerError x y
 
-    -- Join annotations together for lower, except for mutability, which is invalid(?)
+    -- Join annotations together for lower, except for mutability contradiction
     annLower x@(annotations -> annA) y@(annotations -> annB) =
       let annAB   = nub $ annA ++ annB
           invalid = [QTMutable, QTImmutable]
-      in if annAB `intersect` invalid == invalid then lowerError x y else return annAB
+      in if invalid `subsetOf` annAB then lowerError x y else return annAB
 
     lowerBound t@(tag -> QTOperator QTLower) = tvopeval QTLower $ children t
     lowerBound t = return t
@@ -462,8 +462,6 @@ consistentTLower ch =
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
 --   a collection and a record that is a subtype of the collection.
---   TODO: go over in more detail
---   TODO: should really just extract member of collection, not assume record of collection
 --   Collections are also records because you can project on them (lifted attributes)
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
 collectionSubRecord ct@(tag -> QTConst (QTCollection annIds))
@@ -505,6 +503,10 @@ unifyv v t = do
     tvsub t >>= unifyvMuQt tve
 
   where
+    -- Recursive unification. Can only be for self?
+    -- Inject self into every record type in the type
+    -- Why isn't a collection handled here? Do we just assume that recursion
+    -- can only work in collection self types?
     unifyvMuQt tve qt = do
       qt' <- injectSelfQt tve qt
       trace (prettyTaggedSPair "unifyv yoc" v qt') $
@@ -516,6 +518,7 @@ unifyv v t = do
       | occurs v n tve = return $ foldl (@+) tself anns
       | otherwise = return $ Node (tag n :@: anns) nch
 
+    -- We're at a QTLower and see a record that was transformed into a self below us
     inject _ [(tag -> QTSelf)] (Node (QTOperator QTLower :@: anns) [Node (QTCon (QTRecord _) :@: _) _])
       = return $ foldl (@+) tself anns
 
@@ -539,9 +542,12 @@ unifyDrv preF postF qt1 qt2 = do
 
   where
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
+
+    -- numeric type: get lower bound
     unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True) = tvlower t1 t2
 
-    unifyDrv' t1@(tag -> QTPrimitive _ p1) (tag -> QTPrimitive _ p2)
+    -- other primitives have to match
+    unifyDrv' t1@(tag -> QTPrimitive p1) (tag -> QTPrimitive p2)
       | p1 == p2  = return t1
       | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
@@ -551,10 +557,11 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
     -- | Record subtyping for projection
+    -- TODO: this doesn't consider open vs. closed records cleanly/correctly
     unifyDrv' t1@(tag -> QTConst d1@(QTRecord f1))
               t2@(tag -> QTConst d2@(QTRecord f2))
-      | f1 `uniqIntersect` f2 == f1 = onRecord (t1,d1,f1) (t2,d2,f2)
-      | f1 `uniqIntersect` f2 == f2 = onRecord (t2,d2,f2) (t1,d1,f1)
+      | f1 `subsetOf` f2 = onRecord (t1,d1,f1) (t2,d2,f2)
+      | f2 `subsetOf` f1 = onRecord (t2,d2,f2) (t1,d1,f1)
 
     -- | Collection-as-record subtyping for projection
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) t2@(tag -> QTCon (QTRecord _))
@@ -613,16 +620,22 @@ unifyDrv preF postF qt1 qt2 = do
       | tg1 == tg2   = return t1
       | otherwise    = unifyErr t1 t2 "qtypes" ""
 
+    -- recurse unifyDrv
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
     rcr a b = unifyDrv preF postF a b
 
+    -- recurse on the pair of content of each collection
+    -- NOTE: what about the annotations?
     onCollectionPair :: [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
-    onCollectionPair annIds t1 t2 = rcr (head $ children t1) (head $ children t2) >>= return . flip tcol annIds
+    onCollectionPair annIds t1 t2 = rcr (head $ children t1) (head $ children t2) >>= 
+                                      return . flip tcol annIds
 
+    -- sQt: self record describing lifted attributes
     onCollection :: K3 QType -> [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
     onCollection sQt liftedAttrIds
                  ct@(tag -> QTCon (QTCollection _)) rt@(tag -> QTCon (QTRecord ids))
       = do
+          -- substitute col type into children of self record
           subChQt <- mapM (substituteSelfQt ct) $ children sQt
           let selfPairs   = zip liftedAttrIds subChQt
           let projSelfT   = projectNamedPairs ids selfPairs
@@ -634,25 +647,33 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
+    -- unify records, where one is a supertype and another is a subtype
     onRecord :: RecordParts -> RecordParts -> TInfM (K3 QType)
     onRecord (supT, supCon, supIds) (subT, subCon, subIds) =
       let subPairs    = zip subIds $ children subT
+          -- get the subtypes corresponding to labels that are also in the supertype
           subProjT    = projectNamedPairs supIds $ subPairs
-          errk        = "record subtype"
+          errkind     = "record subtype"
+          -- Final constructor once we find the unification:
+          -- We can only unify the supertype labels, so keep those unified values and add
+          -- the subtype labels
           recCtor nch = tdata subCon $ rebuildNamedPairs subPairs supIds nch
-      in onChildren supCon supCon errk (children supT) subProjT recCtor
+      in onChildren supCon supCon errkind (children supT) subProjT recCtor
 
+    -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)
     onChildren tga tgb kind a b ctor
       | tga == tgb = onList a b ctor $ \s -> unifyErr tga tgb kind s
       | otherwise  = unifyErr tga tgb kind ""
 
+    -- Recurse unifyDrv over a list of types, constructing using ctor when done
     onList :: [K3 QType] -> [K3 QType] -> QTypeCtor -> (String -> TInfM (K3 QType)) -> TInfM (K3 QType)
     onList a b ctor errf =
       if length a == length b
         then mapM (uncurry rcr) (zip a b) >>= return . ctor
         else errf "Unification mismatch on lists."
 
+    -- Substitute a collection type for self type inside a type
     substituteSelfQt :: K3 QType -> K3 QType -> TInfM (K3 QType)
     substituteSelfQt ct@(tag -> QTCon (QTCollection _)) qt = mapTree sub qt
       where sub _ (tag -> QTSelf) = return $ ct
