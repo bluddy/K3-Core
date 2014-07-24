@@ -20,13 +20,12 @@ type QTVarId = Int
 -- 1. All polymorphic vars in the type
 -- 2. Type
 data QPType = QPType [QTVarId] (K3 QType)
-                deriving (Eq, Ord, Read, Show)
-
-data QTVariance = QTCovar | QTContra
+                deriving (Eq, Read, Show)
 
 data QType
         = QTBottom
-        | QTOpen      QTVariance QType
+        | QTLower     QType  -- covariant. Can only have record or number
+        | QTHigher    QType  -- contravariant
         | QTPrimitive QTBase
         | QTConst     QTData
         | QTVar       QTVarId
@@ -35,7 +34,7 @@ data QType
           -- Self type is a recursive collection type.
         | QTSelf
         | QTTop
-      deriving (Eq, Ord, Read, Show)
+      deriving (Eq, Read, Show)
 
 -- | Primitive types.
 --   Note this class derives an enum instance which we use to determine precedence.
@@ -48,7 +47,7 @@ data QTBase
         | QTString
         | QTAddress
         | QTNumber
-      deriving (Eq, Ord, Read, Show)
+      deriving (Eq, Read, Show)
 
 qtEnumOfBase :: QTBase -> Int
 qtEnumOfBase QTBool    = 0
@@ -79,7 +78,7 @@ data QTData
         | QTTrigger
         | QTSource
         | QTSink
-      deriving (Ord, Read, Show)
+      deriving (Read, Show)
 
 -- Make records and collections equal independent of id order
 instance Eq QTData where
@@ -99,7 +98,7 @@ data instance Annotation QType
     = QTMutable
     | QTImmutable
     | QTUID UID
-  deriving (Eq, Ord, Read, Show)
+  deriving (Eq, Read, Show)
 
 -- | Type constructors
 tleaf :: QType -> K3 QType
@@ -107,15 +106,6 @@ tleaf t = Node (t :@: []) []
 
 tdata :: QTData -> [K3 QType] -> K3 QType
 tdata d c = Node (QTConst d :@: []) c
-
-topen :: QTVariance -> K3 QType -> K3 QType
-topen var (Node (t :@: annos)) = Node (QTOpen var t :@: annos)
-
-topenco :: K3 QType -> K3 QType
-topenco = topen QTCovar
-
-topencontra :: K3 QType -> K3 QType
-topencontra = topen QTContra
 
 tprim :: QTBase -> K3 QType
 tprim b = tleaf $ QTPrimitive b
@@ -157,10 +147,17 @@ trec idt =
   let (ids, ts) = unzip idt in
   Node (QTRecord ids) ts
 
-topenrec :: QTVariance -> [(Identifier, K3 QType)] -> K3 QType
-topenrec open idt =
-  let (ids, ts) = unzip idt in
-  Node (QTOpen open $ QTRecord ids) ts
+tlowerrec :: [(Identifier, K3 QType)] -> K3 QType
+tlowerrec idt =
+  case trec idt of
+    Node (QTRecord x) ch -> Node (QTLower (QTRecord x)) ch
+    _ -> error "unexpected"
+
+thigherrec :: [(Identifier, K3 QType)] -> K3 QType
+thigherrec idt =
+  case trec idt of
+    Node (QTRecord x) ch -> Node (QTHigher (QTRecord x)) ch
+    _ -> error "unexpected"
 
 tcol :: K3 QType -> [Identifier] -> K3 QType
 tcol ct annIds = tdata (QTCollection annIds) [ct]
