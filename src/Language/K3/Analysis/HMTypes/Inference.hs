@@ -122,7 +122,7 @@ type TVEnv = (QTVarId, (IntMap QTVarID (UID, Maybe Span)))
 
 -- | A type variable binding environment.
 --   1. map of id to type/other id
-type TVBEnv = IntMap QTVarId (K3 QType) 
+type TVBEnv = IntMap QTVarId (K3 QType)
 
 -- | A concretization environment
 --   Shows which types are applied to which other types, which must therefore
@@ -157,9 +157,8 @@ text env k qt muid mspan =
 
 tdel :: TEnv -> Identifier -> TEnv
 tdel env x = HashMap.update removeFront x env
-  where removeFront []   = Nothing
-        removeFront x:xs = Just xs
-
+  where removeFront []     = Nothing
+        removeFront (x:xs) = Just xs
 
 -- TAEnv helpers
 -- Annotation Environment
@@ -284,7 +283,7 @@ intersection :: [a] -> [a] -> [a]
 intersection a b = HashSet.toList $ HashSet.fromList a `HashSet.intersect` HashSet.fromList b
 
 difference :: [a] -> [a] -> [a]
-difference a b = HashSet.toList $ HashSet.fromList a `HashSet.\\` HashSet.fromList b
+difference a b = HashSet.toList $ HashSet.fromList a HashSet.\\ HashSet.fromList b
 
 -- Give the set of all type variables that are allocated in TVE but
 -- not bound there
@@ -320,13 +319,18 @@ varsIn t = IntSet.toList $ runIdentity $ foldMapTree extractVars Set.empty t
     extractVars chAcc _ = return $ Set.unions chAcc
 
 -- The occurs check: if v appears in t
--- Either any of the children of t have v, or a QTVar in t links to v
+-- First, get the last tvar v points to
+-- Either any of the children of t have this tvar, or a QTVar in t links to this tvar
 occurs :: QTVarId -> K3 QType -> TVBEnv -> Bool
-occurs v t@(tag -> QTConst _) tvbe = or $ map (flip (occurs v) tvbe) $ children t
-occurs v   (tag -> QTVar v2) tvbe
-  | v == v2   = True
-  | otherwise = maybe False (flip (occurs v) tvbe) $ tvblkup tvbe v2
-occurs _ _ _ = False
+occurs v t env =
+  -- Follow v to the last tvar available
+  let v' = maybe v id $ fst $ tvchasev env v
+  in loop t
+  where
+    loop (QTConst _) = or $ map loop $ children t
+    loop (QTVar v2)  | v' == v2  = True
+                     | otherwise = maybe False loop $ tvblkup tvbe v2
+    loop _           = False
 
 
 {- TInfM helpers -}
@@ -397,8 +401,8 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
         annLower x y >>=
         -- Find lowest common primitive type, and add combined annotations
           return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
-      | p1 == p2 -> return x 
-      
+      | p1 == p2 -> return x
+
     -- Open record types on both sides: widen to widest type
     tvlower' x@(QTLower(QTConst (QTRecord ids))) y@(QTLower(QTConst (QTRecord ids'))) =
         mergedRecord True ids x ids' y
@@ -423,7 +427,7 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
     -- TODO: check the next 2 carefully
     tvlower' x@(QTVar _) _  = return x
     tvlower' _ y@(QTVar _)  = return y
-      
+
       -- Closed record types: only if they match 100%
       -- We iterate over their children
     tvlower' x@(QTConst (QTRecord ids)) y@QTConst (QTRecord ids')) | x == y = do
@@ -462,11 +466,6 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
        annLower ct1 ct2 >>=
          return . foldl (@+) (tcol ctntLower annIds)
 
-    -- Merge supertype and subtype id/type lists for records
-    -- Call tvlower on labels in common, keep labels that aren't as they are
-    -- NOTE: should be done only on open records
-    mergeCovering commonIds idts1 idts2  =
-
     -- Merge collection and record that fits it
     -- NOTE: this shouldn't be necessary. We can type as if collections
     -- can contain anything, and then just remove the ones that don't have
@@ -484,17 +483,13 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
           invalid = [QTMutable, QTImmutable]
       in if invalid `subsetOf` annAB then lowerError x y else return annAB
 
-    lowerBound t@(tag -> QTOperator QTLower) = tvopeval QTLower $ children t
-    lowerBound t = return t
-
-    lowerError x y = left $ unwords $ ["Invalid lower bound operands: ", show x, "and", show y]
-
 -- | Type operator evaluation.
 -- Run tvlower on list of types, getting the lower bound at each step
 tvopeval :: QTOp -> [K3 QType] -> TInfM (K3 QType)
 tvopeval _ [] = left $ "Invalid qt operator arguments"
 tvopeval QTLower ch = foldM tvlower (head ch) $ tail ch
 
+-- Split into direct types and typevars
 -- Run lower on direct types, then unify and lower type variables with them
 -- If we have only direct types, run lower on them
 -- If we have only typevars, unify amongst them first
@@ -551,11 +546,11 @@ unifyv v1 t@(tag -> QTVar v2)
       modify $ modTvarEnv $ \tve -> tvext tve v1 t
 
 unifyv v t = do
-  tve <- getTVE
-  if not $ occurs v t tve then
+  tvbe <- getTVBE
+  if not $ occurs v t tvbe then
     -- just point the variable to the type
     trace (prettyTaggedSPair "unifyv noc" v t) $
-      modify $ modTvarEnv $ \tve' -> tvext tve' v t
+      modify $ modTvarBindEnv $ \tvbe' -> tvbext tvbe' v t
   else -- recursive type
     tvsub t >>= unifyvMuQt tve
 
