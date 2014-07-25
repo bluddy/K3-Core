@@ -291,7 +291,7 @@ tvfree :: TVEnv -> TVBEnv -> [QTVarId]
 tvfree venv benv = filter (not . (flip IntMap.member benv)) [0..(fst venv)-1]
 
 -- `Shallow' substitution
--- Find a type that's not a variable, or isn't bound
+-- Find a type that's not a variable, or is a free typevar
 tvchase :: TVBEnv -> K3 QType -> K3 QType
 tvchase tbe (tag -> QTVar v) | Just t <- tvblkup tbe v = tvchase tbe t
 tvchase _ t = t
@@ -542,6 +542,7 @@ unifyv v1 t@(tag -> QTVar v2)
   | v1 == v2  = return ()
 
     -- Since they're both variables make one point to the other.
+    -- TODO: chasev t before making v1 point to it
   | otherwise = trace (prettyTaggedSPair "unifyv var" v1 t) $
       modify $ modTvarEnv $ \tve -> tvext tve v1 t
 
@@ -551,28 +552,21 @@ unifyv v t = do
     -- just point the variable to the type
     trace (prettyTaggedSPair "unifyv noc" v t) $
       modify $ modTvarBindEnv $ \tvbe' -> tvbext tvbe' v t
-  else -- recursive type
-    tvsub t >>= unifyvMuQt tve
-
-  where
-    -- Recursive unification. Can only be for self?
+  else do
+    -- Recursive unification. Can only be for self
     -- Inject self into every record type in the type
     -- Why isn't a collection handled here? Do we just assume that recursion
     -- can only work in collection self types?
-    unifyvMuQt tve qt = do
-      qt' <- injectSelfQt tve qt
-      trace (prettyTaggedSPair "unifyv yoc" v qt') $
-        modify $ modTvarEnv $ \tve' -> tvext tve' v qt'
+    qt' <- injectSelfQt tve t
+    trace (prettyTaggedSPair "unifyv yoc" v qt') $
+      modify $ modTvarEnv $ \tvbe' -> tvbext tvbe' v qt'
 
-    injectSelfQt tve qt = mapTree (inject tve) qt
+  where
+    injectSelfQt tvbe qt = mapTree (inject tvbe) qt
 
-    inject tve nch n@(Node (QTCon (QTRecord _) :@: anns) _)
-      | occurs v n tve = return $ foldl (@+) tself anns
+    inject tvbe nch n@(tvchase tvbe -> Node (QTLower (QTCon (QTRecord _)) :@: anns) _)
+      | occurs v n tbve = return $ foldl (@+) tself anns
       | otherwise = return $ Node (tag n :@: anns) nch
-
-    -- We're at a QTLower and see a record that was transformed into a self below us
-    inject _ [(tag -> QTSelf)] (Node (QTOperator QTLower :@: anns) [Node (QTCon (QTRecord _) :@: _) _])
-      = return $ foldl (@+) tself anns
 
     inject _ ch n = return $ Node (tag n :@: annotations n) ch
 
