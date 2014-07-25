@@ -280,8 +280,11 @@ tiincrv env = env {tvarEnv = tvinc (tvarEnv env)}
 subSetOf :: Eq a => [a] -> [a] -> Bool
 subSetOf a b = HashSet.fromList a `Hashset.intersect` HashSet.fromList b == HashSet.fromList a
 
+intersection :: [a] -> [a] -> [a]
+intersection a b = HashSet.toList $ HashSet.fromList a `HashSet.intersect` HashSet.fromList b
+
 difference :: [a] -> [a] -> [a]
-intersect a b = HashSet.toList $ HashSet.fromList a `HashSet.\\` HashSet.fromList b
+difference a b = HashSet.toList $ HashSet.fromList a `HashSet.\\` HashSet.fromList b
 
 -- Give the set of all type variables that are allocated in TVE but
 -- not bound there
@@ -384,30 +387,30 @@ tvsub qt = mapTree sub qt
 --   Really, this is just an expansion to the widest (lowest) type possible, with no
 --   connection to super or subtype
 tvlower :: K3 QType -> K3 QType -> TInfM (K3 QType)
-tvlower a b = getTVBE >>= \tvbe -> tvlower' (tvchase tvbe a) (tvchase tvbe b)
+tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
   where
-    tvlower' a' b' = case (tag a', tag b') of
-      (QTPrimitive p1, QTPrimitive p2)
-        | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] ->
-            -- Union of all annotations but mutability
-            annLower a' b' >>=
-            -- Find lowest common primitive type, and add combined annotations
-            return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
-        | p1 == p2 -> return a'
+    loop a b = tvlower' (tvchase tvbe a) (tvchase tvbe b)
+
+    tvlower' x@(tag -> QTPrimitive p1) y@(tag -> QTPrimitive p2)
+      | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] ->
+        -- Union of all annotations but mutability
+        annLower x y >>=
+        -- Find lowest common primitive type, and add combined annotations
+          return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
+      | p1 == p2 -> return x 
       
-      -- Closed record types
-      x@(QTCon (QTRecord _), y@QTCon (QTRecord _)) | x == y -> x
+    -- Open record types on both sides: widen to widest type
+    tvlower' x@(QTLower(QTConst (QTRecord ids))) y@(QTLower(QTConst (QTRecord ids'))) =
+        mergedRecord True ids x ids' y
 
-      -- Open record types
-      (QTLower(QTCon (QTRecord i1)), QTLower(QTCon (QTRecord i2)))
-        | i1 `subsetOf` i2 -> mergedRecord i1 a' i2 b'
-        | i2 `subsetOf` i1 -> mergedRecord i2 b' i1 a'
-        -- They are disjoint, so join them together
-        | otherwise ->
-            annLower a' b' >>=
-            -- Concrete records should never be any different
-            return . foldl (@+) (trec $ nub $ zip (i1 ++ i2) $ (children a') ++ (children b'))
+    -- Open record and closed record. Widen to closed record if it matches
+    tvlower' x@((QTConst (QTRecord ids)) y@(QTLower(QTConst (QTRecord ids')))
+      | ids' `subsetOf` ids  = mergedRecord False ids x ids' y
+    tvlower' x@((QTLower(QTConst (QTRecord ids))) y@(QTConst (QTRecord ids'))
+      | ids  `subsetOf` ids' = mergedRecord False ids x ids' y
 
+
+     -- TODO: collections: do we need open/closed collection types?
       (QTCon (QTCollection _), QTCon (QTRecord _)) -> coveringCollection a' b'
       (QTCon (QTRecord _), QTCon (QTCollection _)) -> coveringCollection b' a'
 
@@ -415,24 +418,43 @@ tvlower a b = getTVBE >>= \tvbe -> tvlower' (tvchase tvbe a) (tvchase tvbe b)
         | idsA `subsetOf` idsB -> mergedCollection idsB a' b'
         | idsB `subsetOf` idsA -> mergedCollection idsA a' b'
 
-      (QTVar _, QTVar _) -> return a'
-      (QTVar _, _) -> return a'
-      (_, QTVar _) -> return b'
+    -- Free variables. Will be connected by unification
+    tvlower' x@(QTVar _) (QTVar _) = return x
+    -- TODO: check the next 2 carefully
+    tvlower' x@(QTVar _) _  = return x
+    tvlower' _ y@(QTVar _)  = return y
+      
+      -- Closed record types: only if they match 100%
+      -- We iterate over their children
+    tvlower' x@(QTConst (QTRecord ids)) y@QTConst (QTRecord ids')) | x == y = do
+      let (idts, idts') = (zip ids $ children x, zip ids' $ children y)
+      ch <- mapM (\(k,v) -> loop v $ lookup k idts') idts
+      annlower qt1 qt2 >>=
+        return . foldl (@+) (tdata d ch)
 
-      (_, _)
-        | (isQTLower a' && isQTLower b') || isQTLower a' || isQTLower b' -> do
-          lb1 <- lowerBound a'
-          lb2 <- lowerBound b'
-          tvlower lb1 lb2
+    -- handle tuples and other constructors: if they match, we iterate over their children
+    tvlower' x@(QTConst d) y@(QTConst _) | x == y = do
+      ch <- mapM (uncurry loop) $ zip (children x) (children y)
+      annlower x y >>=
+        return . foldl (@+) (tdata d ch)
 
-        | otherwise -> lowerError a' b'
+    -- other primitives are ok if they match
+    tvlower' x y | x == y = x
 
-    -- NOTE: Why does left/right matter?
-    mergedRecord ids1 qt1 ids2 qt2 = do
-      fieldQt <- mergeCovering 
-                  (zip ids1 $ children qt1) (zip ids2 $ children qt2)
+    -- no match on both sides means a mismatch
+    tvlower' x y = lowerError x y
+
+    mergedRecord lower ids1 qt1 ids2 qt2 = do
+      let commonIds = ids1 `intersect` ids2
+          diffIds   = ids1 ++ ids2 `difference` inter
+          idts1     = zip ids1 $ children qt1
+          idts2     = zip ids2 $ children qt2
+          extras    = map (flip lookup idts1) diffIds ++ map (flip lookup idts2) diffIds
+          makeRec   = if lower then tlowerrec else trec
+
+      fieldQt <- mapM (\k -> loop (lookup k idts1) (lookup k idts2)) commonIds
       annLower qt1 qt2 >>=
-        return . foldl (@+) (trec $ zip subid fieldQt)
+        return . foldl (@+) (makeRec $ zip commonIds fieldQt ++ zip diffIds extras)
 
     mergedCollection annIds ct1 ct2 = do
        -- run tvlower on the record of the element type
@@ -441,12 +463,9 @@ tvlower a b = getTVBE >>= \tvbe -> tvlower' (tvchase tvbe a) (tvchase tvbe b)
          return . foldl (@+) (tcol ctntLower annIds)
 
     -- Merge supertype and subtype id/type lists for records
-    -- supAsLeft: call tvlower with superset on the left
     -- Call tvlower on labels in common, keep labels that aren't as they are
     -- NOTE: should be done only on open records
-    mergeCovering idts1 idts2  =
-      let lowerF v1 v2 = tvlower v1 v2
-      in mapM (\(k,v) -> maybe (return v) (lowerF v) $ lookup k sup) sub
+    mergeCovering commonIds idts1 idts2  =
 
     -- Merge collection and record that fits it
     -- NOTE: this shouldn't be necessary. We can type as if collections
