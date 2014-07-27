@@ -102,7 +102,7 @@ rebuildNamedPairs oldIdv newIds newVs = map (replaceNewPair $ zip newIds newVs) 
 
 -- | A type environment.
 --   The first entry is the latest binding of the identifier
-type TEnv = HashMap Identifier [(QPType, Maybe UID, Maybe Span)]
+type TEnv = HashMap Identifier [QPType]
 
 -- | Annotation member environment.
 --   The boolean indicates whether the member is a lifted attribute.
@@ -221,6 +221,9 @@ tvext env v uid mspan = second (IntMap.insert v (uid, mspan)) env
 
 tvinc :: TVEnv -> TVEnv
 tvinc env = first ((+) 1) env
+
+tvlkup :: TVEnv -> QTVarId -> (Maybe UID, Maybe USpan)
+tvlkup env v = maybe (Nothing, Nothing) (\(u,ms) -> (Just u, ms)) $ IntMap.lookup v env
 
 {- TIEnv helpers -}
 -- Full environment
@@ -353,6 +356,9 @@ liftEitherM = either left return
 getTVBE :: TInfM TVBEnv
 getTVBE = get >>= return . tvarBindEnv
 
+getTVE :: TInfM TVEnv
+getTVE = get >>= return . tvarEnv
+
 -- Allocate a fresh type variable
 newtv :: Maybe UID -> Maybe Span -> TInfM (K3 QType)
 newtv muid mspan = do
@@ -367,19 +373,18 @@ newtv muid mspan = do
 -- NOTE: deep substitution breaks links between types
 --       Make sure not to break links for lowers or highers
 --       We should not do it until the VERY end
+-- vidl: list of vids to substitute. If not given, all vids are substituted
 
-tvsub :: K3 QType -> TInfM (K3 QType)
-tvsub qt = mapTree sub qt
+tvsub ::  K3 QType -> TInfM (K3 QType)
+tvsub qt = mapTree (sub IntSet.fromList vidl) qt
   where
-    sub ch t@(tag -> QTConst d) = return $ foldl (@+) (tdata d ch) $ annotations t
-
-    sub _ t@(tag -> QTVar v) = do
+    sub vids _ t@(tag -> QTVar v) = do
       tvbe <- getTVBE
       case tvblkup tvbe v of
         Just t' -> tvsub t' >>= extendAnns t
         _       -> return t
 
-    sub _ t = return t
+    sub _ _ t = return t
 
     -- Add to tdest all the annotations of tsrc
     extendAnns tsrc tdest = return $ foldl (@+) tdest $
@@ -396,12 +401,12 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
     loop a b = tvlower' (tvchase tvbe a) (tvchase tvbe b)
 
     tvlower' x@(tag -> QTPrimitive p1) y@(tag -> QTPrimitive p2)
-      | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] ->
+      | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] =
         -- Union of all annotations but mutability
         annLower x y >>=
         -- Find lowest common primitive type, and add combined annotations
           return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
-      | p1 == p2 -> return x
+      | p1 == p2 = return x
 
     -- Open record types on both sides: widen to widest type
     tvlower' x@(QTLower(QTConst (QTRecord ids))) y@(QTLower(QTConst (QTRecord ids'))) =
@@ -598,7 +603,7 @@ unifyDrv preF postF qt1 qt2 = do
       | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
     -- | Self type unification
-    --   We don't know which collection self refers to
+    --   We don't know which collection self refers to. Any way we can fix that?
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
@@ -783,34 +788,43 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
 
 -- | Given a polytype, for every polymorphic type var, replace all of
 --   its occurrences in t with a fresh type variable. We do this by
---   creating a substitution tve and applying it to t.
+--   creating a substitution tve and using tvsub on this near-empty env,
+--   which replaces only these specific vars.
 --   The new types will unify with our application site.
---   We also strip any mutability qualifiers here since we only instantiate
---   on variable access. (NOTE: is this true?)
 instantiate :: QPType -> TInfM (K3 QType)
-instantiate (QPType tvs t) = withFreshTVE $ do
-  Node (tg :@: anns) ch <- tvsub t
-  return $ Node (tg :@: filter (not . isQTQualified) anns) ch
+instantiate (QPType tvs t) =
+  if null tvs then return t
+  else do
+    withFreshTVBE $ do
+    -- This tvsub will only replace the given type variables
+    -- So it's ok. It's not destroying links.
+    Node (tg :@: anns) ch <- tvsub t
+    return t
  where
    -- Generate fresh vars, run the action with the new, and restore the old
-   withFreshTVE m = do
-    newtve <- associateWithFreshvars tvs
-    oldtve <- getTVE
-    wrapWithTVE newtve oldtve m
+   withFreshTVBE m = do
+    newtvbe <- associateWithFreshvars tvs
+    oldtvbe <- getTVBE
+    wrapWithTVBE newtvbe oldtvbe m
 
    -- Run an action with a before- and after- var environment
-   wrapWithTVE tveBefore tveAfter m = do
-    modify (modTvarEnv $ const tveBefore)
+   wrapWithTVBE tvbeBefore tvbeAfter m = do
+    modify (modTvarBindEnv $ const tvbeBefore)
     r <- m
-    modify (modTvarEnv $ const tveAfter)
+    modify (modTvarBindEnv $ const tvbeAfter)
     return r
 
-   -- Add fresh varIds for all existing varids
-   associateWithFreshvars tvs = foldlM addFreshVar (return tvenv0) tvs
+   -- Add fresh varIds for all existing tvars
+   -- This was broken on the old implementation, which would give low vids
+   -- to the instantiated types.
+   associateWithFreshvars tvs = foldlM addFreshVar (return tvbenv0) tvs
      where
        addFreshVar acc tv = do
-         tvfresh <- newtv
-         return $ tvext acc tv tvfresh
+         -- Copy over uid and span
+         tve <- getTVE
+         let (muid, mspan) = tvlkup tve tv
+         tvfresh <- newtv muid mspan
+         return $ tvbext acc tv tvfresh
 
 -- | Return a monomorphic polytype.
 monomorphize :: (Monad m) => K3 QType -> m QPType
@@ -822,12 +836,14 @@ generalize ta = do
  tve_before <- getTVE
  t          <- ta
  tve_after  <- getTVE
- t'         <- tvsub t -- NOTE: why substitute? It just breaks links
  -- Check for free vars that have been captured after the action
- -- NOTE: Why do this? Why not just check for free vars?
- let tvdep = tvDependentSet (tvfree tve_before) tve_after
+ -- We need fvs in t that are not bound in the environment
+ -- This is potentially a very expensive action
+ let freeBefore = tvfree tve_before
+     tvdep = tvDependentSet freeBefore tve_after
  -- get the set of free vars
- let fv    = filter (not . tvdep) $ varsIn t'
+     freeAfter = tvfree tve_after
+     fv  = filter (\x -> x `member` freeAfter && not $ tvdep x ) $ varsIn t
  return $ QPType fv t
 
  -- ^ We return an unsubstituted type to preserve type variables
@@ -1010,7 +1026,10 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       modify (\env -> tiexte env i mt)
 
     lambdaBinding :: K3 Expression -> K3 Expression -> TInfM ()
-    lambdaBinding _ (tag -> ELambda i) = newtv >>= monoBinding i
+    lambdaBinding _ n@(Node (ELambda i :@: annos) _) = do
+      let muid = n @~ isEUID
+          mspan = n @~ isESpan
+      newtv muid mspan >>= monoBinding i
     lambdaBinding _ _ = return ()
 
     -- TODO: need to chase pointers in qTypeOfM
@@ -1021,33 +1040,34 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       modify $ \env -> tiexte env i ipt
       return [iu]
 
-    sidewaysBinding ch1 (tag -> EBindAs b) = do
+    sidewaysBinding ch1 n@(tag -> EBindAs b) = do
         ch1T <- qTypeOfM ch1
+        let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
         case b of
           BIndirection id' -> do
-            itv <- newtv
+            itv <- newtv muid mspan
             void $ unifyM ch1T (tind itv) $ bindErr "indirection"
             monoBinding id' itv
 
           BTuple ids -> do
-            idtvs <- mapM (const newtv) ids
-            void   $ unifyM ch1T (ttup idtvs) $ bindErr "tuple"
+            idtvs <- mapM (const $ newtv muid mspan) ids
+            void $ unifyM ch1T (ttup idtvs) $ bindErr "tuple"
             mapM_ (uncurry monoBinding) $ zip ids idtvs
 
-          -- TODO: partial bindings?
-          BRecord ijs -> do
-            jtvs <- mapM (const newtv) ijs
-            void $  unifyM ch1T (trec $ flip zip jtvs $ map fst ijs) $ bindErr "record"
-            mapM_ (uncurry monoBinding) $ flip zip jtvs $ map snd ijs
+          BRecord ids -> do
+            idtvs <- mapM (const $ newtv muid mspan) ids
+            void $ unifyM ch1T (trec $ zip (map fst ids) idtvs) $ bindErr "record"
+            mapM_ (uncurry monoBinding) $ zip (map snd ids) idtvs
 
         return [iu]
 
       where
         bindErr kind reason = unwords ["Invalid", kind, "bind-as:", reason]
 
-    sidewaysBinding ch1 (tag -> ECaseOf i) = do
+    sidewaysBinding ch1 n@(tag -> ECaseOf i) = do
       ch1T <- qTypeOfM ch1
-      itv  <- newtv
+      let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
+      itv  <- newtv muid mspan
       void $  unifyM ch1T (topt itv) $ (("Invalid case-of source expression: ")++)
       return [monoBinding i itv, modify $ \env -> tidele env i]
 
@@ -1061,7 +1081,8 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
     inferQType _ n@(tag -> EConstant (CString _)) = return $ n .+ tstr
 
     inferQType _ n@(tag -> EConstant (CNone nm)) = do
-      tv <- newtv
+      let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
+      tv <- newtv muid mspan
       let ntv = case nm of
                   NoneMut   -> mutQT tv
                   NoneImmut -> immutQT tv
@@ -1073,10 +1094,10 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       colqt <- mkCollectionQType annIds cqt
       return $ n .+ colqt
 
-    -- | Variable specialization. Note that instantiate strips qualifiers.
-    inferQType _ n@(tag -> EVariable i) = do
+    -- | Variable specialization.
+    inferQType _ n@(tag -> EVariable id') = do
         env <- get
-        qt  <- either (lookupError i) instantiate (tilkupe env i)
+        qt  <- either (lookupError id') instantiate (tilkupe env id')
         return $ n .+ qt
 
     -- | Data structures. Qualifiers are taken from child expressions by rebuildE.
@@ -1281,12 +1302,11 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
 {- Collection type construction -}
 
--- Only allow record contents in this version of the type system
--- Make a collection qtype into the equivalent record
+-- Make a collection qtype based on the contents (always a record)
 mkCollectionQType :: [Identifier] -> K3 QType -> TInfM (K3 QType)
 mkCollectionQType annIds contentQt@(tag -> QTCon (QTRecord _)) =
   return $ tcol contentQt annIds
-mkCollectionQType annIds contentQt@(tag -> QTOpen _ (QTCon (QTRecord _))) =
+mkCollectionQType annIds contentQt@(tag -> QTLower (QTCon (QTRecord _))) =
   return $ tcol contentQt annIds
 
 mkCollectionQType _ qt = left $ "Invalid content record type: " ++ show qt
