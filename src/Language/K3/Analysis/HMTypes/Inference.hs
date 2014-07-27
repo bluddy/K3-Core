@@ -94,6 +94,10 @@ qTypeOfM e = case e @~ isEQType of
 projectNamedPairs :: [Identifier] -> [(Identifier, a)] -> [a]
 projectNamedPairs ids idv = snd $ unzip $ filter (\(k,_) -> k `elem` ids) idv
 
+-- Rearrange named pairs according to identifier list
+shuffleNamedPairs :: [Identifier] -> [(Identifier, a)] -> [a]
+shuffleNamedPairs ids idv = map (flip lookup idv) ids
+
 -- Replace matching values in newIds newVs if there's an id match
 rebuildNamedPairs :: [(Identifier, a)] -> [Identifier] -> [a] -> [a]
 rebuildNamedPairs oldIdv newIds newVs = map (replaceNewPair $ zip newIds newVs) oldIdv
@@ -603,9 +607,19 @@ unifyDrv preF postF qt1 qt2 = do
       | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
     -- | Self type unification
-    --   We don't know which collection self refers to. Any way we can fix that?
+    --   TODO: We don't know which collection self refers to. Any way we can fix that?
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
+
+    -- | Closed records must agree 100%
+    --   Our comparison already takes care of id order at the top level
+    --   We need to make sure that we recurse in the right order
+    unifyDrv' n1@(tag -> QTConst d1@(QTRecord f1))
+              n2@(tag -> QTConst d2@(QTRecord f2)) | n1 == n2 =
+      -- Arrange both sides by order of first record
+      let ch2 = shuffleNamedPairs f1 (zip f2 $ children n2)
+          recCtor nch = trec (zip f1 nch)
+      in onChildren d1 d2 "records" (children n1) ch2 recCtor
 
     -- | Record subtyping for projection
     -- TODO: this doesn't consider open vs. closed records cleanly/correctly
@@ -791,6 +805,7 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
 --   creating a substitution tve and using tvsub on this near-empty env,
 --   which replaces only these specific vars.
 --   The new types will unify with our application site.
+--   NOTE: I don't like how this is built. It depends on a certain state (tvbe)
 instantiate :: QPType -> TInfM (K3 QType)
 instantiate (QPType tvs t) =
   if null tvs then return t
@@ -1108,16 +1123,18 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
                                              return . ((rebuildE n ch) .+) . tind
     inferQType ch n@(tag -> ETuple)      = mapM qTypeOfM ch   >>=
                                              return . ((rebuildE n ch) .+) . ttup
+    -- One of the few ways we can have a closed record
     inferQType ch n@(tag -> ERecord ids) = mapM qTypeOfM ch   >>=
                                              return . ((rebuildE n ch) .+) . trec . zip ids
 
-    -- | Lambda expressions are passed the post-processed environment,
-    --   so the type variable for the identifier is bound in the type environment.
+    -- | Lambda expressions already had tvars created in lambdabinding
     inferQType ch n@(tag -> ELambda i) = do
         env  <- get
         ipt  <- either (lambdaBindingErr i) return $ tilkupe env i
         chqt <- qTypeOfM $ head ch
+        -- Delete the binding from the state now that we're going up the tree
         void $ modify $ \env' -> tidele env' i
+        -- Check for monomorphism
         case ipt of
           QPType [] iqt -> return $ rebuildE n ch .+ tfun iqt chqt
           _             -> polyLambdaBindingErr
@@ -1126,11 +1143,11 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
     --   ensuring that the source is mutable.
     inferQType ch n@(tag -> EAssign id') = do
       env <- get
-      (ipt, muid) <- either (assignBindingErr id') return $ tilkupe env id'
+      ipt <- either (assignBindingErr id') return $ tilkupe env id'
       eqt <- qTypeOfM $ head ch
       case ipt of
         QPType [] iqt -- monomorphic
-          | (iqt @~ isQTQualified) == Just QTMutable -> do
+          | iqt @~ isQTQualified == Just QTMutable -> do
               void $ unifyM (iqt @- QTMutable) eqt $
                 mkErrorF n (("Invalid assignment to " ++ id' ++ ": ") ++)
               return $ rebuildE n ch .+ tunit
@@ -1139,27 +1156,30 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
         _ -> polyAssignBindingErr
 
     inferQType ch n@(tag -> EProject id') = do
+      let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
       srcqt   <- qTypeOfM $ head ch
-      fieldqt <- newtv
+      fieldqt <- newtv muid mspan
       let prjqt = tlowerrec [(id', fieldqt)]
       void $ trace (prettyTaggedPair ("infer prj " ++ id') srcqt prjqt)
            $ unifyM srcqt prjqt $ mkErrorF n
              ((unlines ["Invalid record projection:", pretty srcqt, "and", pretty prjqt]) ++)
       return $ rebuildE n ch .+ fieldqt
 
-    -- TODO: reorder inferred record fields based on argument at application.
     -- TODO: add applied lower/higher to concretization set
     -- TODO: don't force lower unification on lambda application
     inferQType ch n@(tag -> EOperate OApp) = do
+      let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
       fnqt  <- qTypeOfM $ head ch
       argqt <- qTypeOfM $ last ch
-      retqt <- newtv
+      retqt <- newtv muid mspan
       let errf = mkErrorF n (unlines ["Invalid function application:",
                                        pretty fnqt,
                                        "and",
                                        pretty (tfun argqt retqt), ":"] ++)
       void $ trace (prettyTaggedTriple "infer app " n fnqt $ tfun argqt retqt) $
-        unifyWithOverrideM fnqt (tfun argqt retqt) errf
+        -- Apply needs a special unification, since we don't want to widen records
+        -- and we do want to preserve the subtype relation
+        unifyAppM fnqt (tfun argqt retqt) errf
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EOperate OSeq) = do
@@ -1170,7 +1190,8 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     -- | Check trigger-address pair and unify trigger type and message argument.
     inferQType ch n@(tag -> EOperate OSnd) = do
-        trgtv <- newtv
+        let (muid, mspan) = (n @~ isEUID, n @~ isESpan)
+        trgtv <- newtv muid mspan
         void $ unifyBinaryM (ttup [ttrg trgtv, taddr]) trgtv ch n sndError
         return $ rebuildE n ch .+ tunit
 
@@ -1178,8 +1199,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
     inferQType ch n@(tag -> EOperate op)
     -- TODO: deal with lower and numeric
       | numeric op = do
-            (lqt, rqt) <- unifyBinaryM tnum tnum ch n numericError
-            resultqt   <- delayNumericQt lqt rqt
+            (lqt, rqt) <- unifyBinaryM tlowernum tlowernum ch n numericError
             return $ rebuildE n ch .+ resultqt
 
       | comparison op = do
@@ -1197,29 +1217,14 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
             return $ rebuildE n ch .+ tstr
 
       | op == ONeg = do
-            chqt <- unifyUnaryM tnum ch $ mkErrorF n uminusError
-            let resultqt = case tag chqt of
-                             QTPrimitive _  -> chqt
-                             QTVar _ -> chqt
-                             -- NOTE:?
-                             _ -> tnum
-            return $ rebuildE n ch .+ resultqt
+            chqt <- unifyUnaryM tlowernum ch $ mkErrorF n uminusError
+            return $ rebuildE n ch .+ chqt
 
       | op == ONot = do
             void $ unifyUnaryM tbool ch $ mkErrorF n negateError
             return $ rebuildE n ch .+ tbool
 
       | otherwise = left $ "Invalid operation: " ++ show op
-
-      where
-        delayNumericQt l r
-          | or (map isQTVar   [l, r]) = return $ tlower [l,r]
-          | or (map isQTLower [l, r]) = return $ tlower $
-                                          concatMap childrenOrSelf [l,r]
-          | otherwise = tvlower l r
-
-        childrenOrSelf t@(tag -> QTOperator QTLower) = children t
-        childrenOrSelf t = [t]
 
     -- First child generation has already been performed in sidewaysBinding
     -- Delete the parameter from the env as we leave this node
@@ -1240,6 +1245,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     -- First child unification has already been performed in sidewaysBinding
     inferQType ch n@(tag -> ECaseOf _) = do
+      -- First child is EType, so skip it
       sqt   <- qTypeOfM $ ch !! 1
       nqt   <- qTypeOfM $ last ch
       retqt <- unifyWithOverrideM sqt nqt $ mkErrorF n (("Mismatched case-of branch types: ") ++)
@@ -1262,8 +1268,10 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     inferQType ch n  = return $ rebuildE n ch
       -- ^ TODO unhandled: ESelf, EImperative
+      -- ESelf should have annotations to compare to collections
 
     rebuildE (Node t _) ch = Node t ch
+
 
     unifyBinaryM lexpected rexpected ch n errf = do
       lqt <- qTypeOfM $ head ch

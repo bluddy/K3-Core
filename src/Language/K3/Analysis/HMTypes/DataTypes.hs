@@ -195,6 +195,9 @@ taddr = tprim QTAddress
 tnum :: K3 QType
 tnum = tprim QTNumber
 
+tlowernum :: K3 QType
+tlowernum = QTLower $ tprim QTNumber
+
 tunit :: K3 QType
 tunit = ttup []
 
@@ -212,6 +215,8 @@ isQTNumeric :: K3 QType -> Bool
 isQTNumeric (tag -> QTPrimitive _ QTInt)    = True
 isQTNumeric (tag -> QTPrimitive _ QTReal)   = True
 isQTNumeric (tag -> QTPrimitive _ QTNumber) = True
+isQTNumeric (tag -> QTLower t)  = isQTNumeric t
+isQTNumeric (tag -> QTHigher t) = isQTNumeric t
 isQTNumeric _ = False
 
 isQTVar :: K3 QType -> Bool
