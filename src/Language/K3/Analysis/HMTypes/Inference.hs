@@ -526,7 +526,7 @@ consistentTLower ch =
 --   Collections are also records because you can project on them (lifted attributes)
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
 collectionSubRecord ct@(tag -> QTConst (QTCollection annIds))
-                       (tag -> QTConst (QTRecord ids))
+                       (getQTRecordIds -> Just ids)
   = get >>= mkColQT >>= return . testF
   where
     mkColQT tienv = do
@@ -615,31 +615,42 @@ unifyDrv preF postF qt1 qt2 = do
     --   Our comparison already takes care of id order at the top level
     --   We need to make sure that we recurse in the right order
     unifyDrv' n1@(tag -> QTConst d1@(QTRecord f1))
-              n2@(tag -> QTConst d2@(QTRecord f2)) | n1 == n2 =
-      -- Arrange both sides by order of first record
-      let ch2 = shuffleNamedPairs f1 (zip f2 $ children n2)
-          recCtor nch = trec (zip f1 nch)
-      in onChildren d1 d2 "records" (children n1) ch2 recCtor
+              n2@(tag -> QTConst d2@(QTRecord f2))
+      | n1 == n2 =
+        -- Arrange both sides by order of first record
+        let ch2 = shuffleNamedPairs f1 (zip f2 $ children n2)
+            recCtor nch = trec (zip f1 nch)
+        in onChildren d1 d2 "closed-records" (children n1) ch2 recCtor
 
-    -- | Record subtyping for projection
-    -- TODO: this doesn't consider open vs. closed records cleanly/correctly
-    unifyDrv' t1@(tag -> QTConst d1@(QTRecord f1))
-              t2@(tag -> QTConst d2@(QTRecord f2))
-      | f1 `subsetOf` f2 = onRecord (t1,d1,f1) (t2,d2,f2)
-      | f2 `subsetOf` f1 = onRecord (t2,d2,f2) (t1,d1,f1)
+      | otherwise = unifyErr n1 n2 "closed-records"
 
+    -- | Open Record and closed record combinations
+    unifyDrv' t1@(getQTRecordIds -> Just f1) t2@(getQTRecordIds -> Just f2)
+      -- Check for correct subtyping in some cases
+      | isQTLower t1 && isQTClosed t2 && f1 `subsetOf` f2 = onLowerRecord t1 t2
+      | isQTClosed t1 && isQTLower t2 && f2 `subsetOf` f1 = onLowerRecord t1 t2
+      | isQTClosed t1 && isQTHigher t2 && f1 `subsetOf` f2 = onLowerRecord t1 t2
+      | isQTHigher t1 && isQTClosed t2 && f2 `subsetOf` f1 = onLowerRecord t1 t2
+      | isQTLower t1 && isQTLower t2 = onLowerRecord t1 t2
+      | isQTHigher t1 && isQTHigher t2 = onLowerRecord t1 t2
+      | isQTLower t1 && isQTHigher t2 = onLowerRecord t1 t2
+      | isQTHigher t1 && isQTLower t2 = onLowerRecord t1 t2
+      | _ = unifyErr t1 t2 "record-combination"
+    
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
-    unifyDrv' t1@(tag -> QTConst (QTCollection _)) t2@(tag -> QTConst (QTRecord _))
+    unifyDrv' t1@(tag -> QTConst (QTCollection _)) t2@(isQTRecord -> True)
       = collectionSubRecord t1 t2 >>= \case
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t1 t2
           _ -> unifyErr t1 t2 "collection-record" ""
 
-    unifyDrv' t1@(tag -> QTConst (QTRecord _)) t2@(tag -> QTConst (QTCollection _))
+    unifyDrv' t1@(isQTRecord -> True) t2@(tag -> QTConst (QTCollection _))
       = collectionSubRecord t2 t1 >>= \case
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t2 t1
           _ -> unifyErr t1 t2 "collection-record" ""
 
+    -- TODO: support non-subtype ie. widening
+    -- TODO: Also support any order of annotations
     unifyDrv' t1@(tag -> QTConst (QTCollection idsA)) t2@(tag -> QTConst (QTCollection idsB))
         | idsA `subsetOf` idsB = onCollectionPair idsB t1 t2
         | idsB `subsetOf` idsA = onCollectionPair idsA t1 t2
@@ -648,44 +659,8 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' t1@(tag -> QTConst d1) t2@(tag -> QTConst d2) =
       onChildren d1 d2 "datatypes" (children t1) (children t2) (tdata d1)
 
-    -- | Unification of a delayed LB operator applies to the lower bounds of each set.
-    --   This returns a merged delayed LB operator containing all variables, and the lower
-    --   bound of the non-variable elements.
-    --   TODO: almost all records should be lower bound/higher bound
-    --   NOTE: not sure this is what we want to do
-    unifyDrv' t1@(tag -> QTOperator QTLower) t2@(tag -> QTOperator QTLower) = do
-      lb1 <- lowerBound t1 -- get lower bound of all things below t1
-      lb2 <- lowerBound t2 -- "" t2
-      lbs <- case (tag lb1, tag lb2) of
-               (QTCon (QTRecord _), QTCon (QTRecord _)) -> do
-                 lb' <- tvlower lb1 lb2
-                 return $ if lb' `elem` [lb1, lb2] then [lb1,lb2] else [lb',lb1,lb2]
-               (_,_) -> return [lb1, lb2]
-      -- We unify all the lower bounds. Does this make sense?
-      void $ foldM rcr (head $ lbs) $ tail lbs
-      -- To return a type, we do this again... hmm
-      consistentTLower $ children t1 ++ children t2
-
-    -- TODO: we should check that tv is free. Otherwise we can cause a loop, no?
-    -- I guess that's covered by the occurs check
     unifyDrv' tv@(tag -> QTVar v) t = unifyv v t >> return tv
     unifyDrv' t tv@(tag -> QTVar v) = unifyv v t >> return tv
-
-    -- | Unification of a lower bound with a non-bound applies to the non-bound
-    --   and the lower bound of the deferred set.
-    --   This pattern match applies after type variable unification to allow typevars
-    --   to match the lower-bound set.
-    unifyDrv' t1@(tag -> QTOperator QTLower) t2 = do
-      lb1 <- lowerBound t1
-      void $ rcr lb1 t2
-      r <- consistentTLower $ children t1 ++ [t2]
-      trace (boxToString $ ["consistentTLowerL "] %+ prettyLines r) $ return r
-
-    unifyDrv' t1 t2@(tag -> QTOperator QTLower) = do
-      lb2 <- lowerBound t2
-      void $ rcr t1 lb2
-      r <- consistentTLower $ [t1] ++ children t2
-      trace (boxToString $ ["consistentTLowerR "] %+ prettyLines r) $ return r
 
     -- | Top unifies with any value. Bottom unifies with only itself.
     unifyDrv' t1@(tag -> tg1) t2@(tag -> tg2)
@@ -708,7 +683,7 @@ unifyDrv preF postF qt1 qt2 = do
     -- unify the record with the collection
     onCollection :: K3 QType -> [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
     onCollection selfQt liftedAttrIds
-                 ct@(tag -> QTCon (QTCollection _)) rt@(tag -> QTCon (QTRecord ids))
+                 ct@(tag -> QTCon (QTCollection _)) rt@(getQTRecordIds -> Just ids)
       = do
           -- substitute col type into children of self record
           subChQt <- mapM (substituteSelfQt ct) $ children selfQt
@@ -722,18 +697,25 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
-    -- unify records, where one is a supertype and another is a subtype
-    onRecord :: RecordParts -> RecordParts -> TInfM (K3 QType)
-    onRecord (supT, supCon, supIds) (subT, subCon, subIds) =
-      let subPairs    = zip subIds $ children subT
-          -- get the subtypes corresponding to labels that are also in the supertype
-          subProjT    = projectNamedPairs supIds $ subPairs
-          errkind     = "record subtype"
-          -- Final constructor once we find the unification:
-          -- We can only unify the supertype labels, so keep those unified values and add
-          -- the subtype labels
-          recCtor nch = tdata subCon $ rebuildNamedPairs subPairs supIds nch
-      in onChildren supCon supCon errkind (children supT) subProjT recCtor
+    onLowerRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
+      let commonIds = ids `intersection` ids'
+          diffIds = ids ++ ids' `difference` commonIds
+          (lch, rch) = (matchChildren commonIds ids lt, matchChildren commonIds ids' rt)
+          (lchDiff, rchDiff) = (matchChildren diffIds ids lt, matchChildren diffIds ids' rt)
+      -- Recurse on the common children, unifying them
+      commonCh' <- mapM (uncurry rcr) $ zip lch rch
+      -- Recreate both records with the unified children
+      let l = recreateRecord (tag lt) $ zip (commonIds ++ diffIds) $ commonCh' ++ lchDiff
+          r = recreateRecord (tag rt) $ zip (commonIds ++ diffIds) $ commonCh' ++ rchDiff
+      tvlower l r
+
+      where
+        matchChildren idgroup idl n = shuffleNamedPairs idgourp $ zip idl $ children n
+
+        -- recreate a record, whether it's closed or open
+        recreateRecord (QTLower t) newIdVals = QTLower(recreateRecord t newIdVals)
+        recreateRecord QTHigher t) newIdVals = QTHigher(recreateRecord t newIdVals)
+        recreateRecord (QTConst (QTRecord _)) newIdVals = trec newIdVals
 
     -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)

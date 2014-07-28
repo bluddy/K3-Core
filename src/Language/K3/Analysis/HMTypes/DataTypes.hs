@@ -223,6 +223,28 @@ isQTVar :: K3 QType -> Bool
 isQTVar (tag -> QTVar _) = True
 isQTVar _ = False
 
+isQTLower:: K3 QType -> Bool
+isQTLower (tag -> QTLower _) = True
+isQTLower _ = False
+
+isQTHigher:: K3 QType -> Bool
+isQTHigher (tag -> QTHigher _) = True
+isQTHigher _ = False
+
+isQTClosed :: K3 QType -> Bool
+isQTClosed (tag -> QTLower _) = False
+isQTClosed (tag -> QTHigher _) = False
+isQTClosed _ = True
+
+isQTRecord :: K3 QType -> Bool
+isQTRecord n = maybe False (const True) getQTRecordIds n
+
+getQTRecordIds :: K3 QType -> Maybe [Identifier]
+getQTRecordIds (tag -> QTConst (QTRecord ids)) = Just ids
+getQTRecordIds (tag -> QTLower t) = getQTRecordIds t
+getQTRecordIds (tag -> QTHigher t) = getQTRecordIds t
+getQTRecordIds _ = Nothing
+
 getQTUID :: Annotation QType -> UID
 getQTUID (QTUID uid) = uid
 getQTUID _ = -1
