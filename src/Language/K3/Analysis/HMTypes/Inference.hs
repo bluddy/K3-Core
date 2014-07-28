@@ -396,9 +396,9 @@ tvsub qt = mapTree (sub IntSet.fromList vidl) qt
 
 -- | Lower bound computation for numeric and record types.
 --   Called by unify on nums and records
---   This function does not preserve annotations.(NOTE: why?)
 --   Really, this is just an expansion to the widest (lowest) type possible, with no
 --   connection to super or subtype
+--   It's not recursive. Unify does the recursive part
 tvlower :: K3 QType -> K3 QType -> TInfM (K3 QType)
 tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
   where
@@ -491,34 +491,6 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
       let annAB   = nub $ annA ++ annB
           invalid = [QTMutable, QTImmutable]
       in if invalid `subsetOf` annAB then lowerError x y else return annAB
-
--- | Type operator evaluation.
--- Run tvlower on list of types, getting the lower bound at each step
-tvopeval :: QTOp -> [K3 QType] -> TInfM (K3 QType)
-tvopeval _ [] = left $ "Invalid qt operator arguments"
-tvopeval QTLower ch = foldM tvlower (head ch) $ tail ch
-
--- Split into direct types and typevars
--- Run lower on direct types, then unify and lower type variables with them
--- If we have only direct types, run lower on them
--- If we have only typevars, unify amongst them first
-consistentTLower :: [K3 QType] -> TInfM (K3 QType)
-consistentTLower ch =
-    case partition isQTVar $ nub ch of
-      ([], [])          -> left "Invalid lower qtype"
-      ([], nonvarCh)    -> return $ tlower $ nonvarCh
-      (varCh, [])       -> do
-        tve <- getTVE
-        unifiedLower (tail varCh) (tvchase tve $ head varCh)
-      (varCh, nonVarCh) -> tvopeval QTLower nonvarCh >>= unifiedLower varCh
-  where
-    -- Run lower on type variables, after unifying with a real type
-    unifiedLower vch lb = do
-      void $ mapM_ (extractAndUnifyV lb) vch
-      return $ tlower $ [lb]++vch
-
-    extractAndUnifyV t (tag -> QTVar v) = unifyv v t
-    extractAndUnifyV _ _ = left "Invalid type var during lower qtype merge"
 
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
@@ -627,14 +599,14 @@ unifyDrv preF postF qt1 qt2 = do
     -- | Open Record and closed record combinations
     unifyDrv' t1@(getQTRecordIds -> Just f1) t2@(getQTRecordIds -> Just f2)
       -- Check for correct subtyping in some cases
-      | isQTLower t1 && isQTClosed t2 && f1 `subsetOf` f2 = onLowerRecord t1 t2
-      | isQTClosed t1 && isQTLower t2 && f2 `subsetOf` f1 = onLowerRecord t1 t2
-      | isQTClosed t1 && isQTHigher t2 && f1 `subsetOf` f2 = onLowerRecord t1 t2
-      | isQTHigher t1 && isQTClosed t2 && f2 `subsetOf` f1 = onLowerRecord t1 t2
-      | isQTLower t1 && isQTLower t2 = onLowerRecord t1 t2
-      | isQTHigher t1 && isQTHigher t2 = onLowerRecord t1 t2
-      | isQTLower t1 && isQTHigher t2 = onLowerRecord t1 t2
-      | isQTHigher t1 && isQTLower t2 = onLowerRecord t1 t2
+      | isQTLower t1  && isQTClosed t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
+      | isQTClosed t1 && isQTLower t2  && f2 `subsetOf` f1 = onOpenRecord t1 t2
+      | isQTClosed t1 && isQTHigher t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
+      | isQTHigher t1 && isQTClosed t2 && f2 `subsetOf` f1 = onOpenRecord t1 t2
+      | isQTLower t1  && isQTLower t2  = onOpenRecord t1 t2
+      | isQTHigher t1 && isQTHigher t2 = onOpenRecord t1 t2
+      | isQTLower t1  && isQTHigher t2 = onOpenRecord t1 t2
+      | isQTHigher t1 && isQTLower t2  = onOpenRecord t1 t2
       | _ = unifyErr t1 t2 "record-combination"
     
     -- | Collection-as-record subtyping for projection
@@ -672,6 +644,12 @@ unifyDrv preF postF qt1 qt2 = do
     -- recurse unifyDrv
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
     rcr a b = unifyDrv preF postF a b
+    
+    -- Join annotations together for except for mutability contradiction
+    unifyAnno x@(annotations -> annA) y@(annotations -> annB) =
+      let annAB   = nub $ annA ++ annB
+          invalid = [QTMutable, QTImmutable]
+      in if invalid `subsetOf` annAB then unifyErr x y "mutability-annotations" else return annAB
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller
@@ -697,25 +675,27 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
-    onLowerRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
-      let commonIds = ids `intersection` ids'
-          diffIds = ids ++ ids' `difference` commonIds
+    onOpenRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
+      let allIds = ids ++ ids'
+          commonIds = ids `intersection` ids'
+          diffIds = allIds `difference` commonIds
           (lch, rch) = (matchChildren commonIds ids lt, matchChildren commonIds ids' rt)
-          (lchDiff, rchDiff) = (matchChildren diffIds ids lt, matchChildren diffIds ids' rt)
+          diffCh = shuffleNamedPairs diffIds $ zip allIds $ children lt ++ children rt
       -- Recurse on the common children, unifying them
-      commonCh' <- mapM (uncurry rcr) $ zip lch rch
-      -- Recreate both records with the unified children
-      let l = recreateRecord (tag lt) $ zip (commonIds ++ diffIds) $ commonCh' ++ lchDiff
-          r = recreateRecord (tag rt) $ zip (commonIds ++ diffIds) $ commonCh' ++ rchDiff
-      tvlower l r
+      commonCh <- mapM (uncurry rcr) $ zip lch rch
+      -- Create a new record
+      let record = recreateRecord (tag lt) (tag rt) $
+                zip (commonIds ++ diffIds) $ commonCh ++ diffCh
+      return fold (@+) record $ unifyAnnos lt rt
 
       where
-        matchChildren idgroup idl n = shuffleNamedPairs idgourp $ zip idl $ children n
+        matchChildren idgroup idl n = shuffleNamedPairs idgroup $ zip idl $ children n
 
-        -- recreate a record, whether it's closed or open
-        recreateRecord (QTLower t) newIdVals = QTLower(recreateRecord t newIdVals)
-        recreateRecord QTHigher t) newIdVals = QTHigher(recreateRecord t newIdVals)
-        recreateRecord (QTConst (QTRecord _)) newIdVals = trec newIdVals
+        -- recreate a result record
+        -- TODO: handle highers distinctly
+        recreateRecord (isQTClosed -> True) _ idvs = trec idvs
+        recreateRecord _ (isQTClosed -> True) idvs = trec idvs
+        recreateRecord _ _ idvs = tlowerrec idvs
 
     -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)
@@ -737,8 +717,6 @@ unifyDrv preF postF qt1 qt2 = do
             sub ch (Node n _)     = return $ Node n ch
 
     substituteSelfQt ct _ = subSelfErr ct
-
-    lowerBound t = tvopeval QTLower $ children t
 
     -- Errors
     primitiveErr a b annos = unifyErr a b "primitives" "" annos
