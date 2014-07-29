@@ -499,6 +499,7 @@ type UnifyPostF a = (a, a) -> K3 QType -> TInfM (K3 QType)
 
 -- | A unification driver, i.e., common unification code for both
 --   our standard unification method, and unification with variable overrides
+--   For 2 lower bound types, we find the lowest
 unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> K3 QType -> K3 QType -> TInfM (K3 QType)
 unifyDrv preF postF qt1 qt2 = do
     (p1, qt1') <- preF qt1
@@ -543,17 +544,12 @@ unifyDrv preF postF qt1 qt2 = do
       | otherwise = unifyErr n1 n2 "closed-records"
 
     -- | Open Record and closed record combinations
-    unifyDrv' t1@(getQTRecordIds -> Just f1) t2@(getQTRecordIds -> Just f2)
-      -- Check for correct subtyping in some cases
-      | isQTLower  t1 && isQTClosed t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
-      | isQTClosed t1 && isQTLower  t2 && f2 `subsetOf` f1 = onOpenRecord t1 t2
-      | isQTClosed t1 && isQTHigher t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
-      | isQTHigher t1 && isQTClosed t2 && f2 `subsetOf` f1 = onOpenRecord t1 t2
-      | isQTLower  t1 && isQTLower  t2 = onOpenRecord t1 t2
-      | isQTHigher t1 && isQTHigher t2 = onOpenRecord t1 t2
-      | isQTLower  t1 && isQTHigher t2 = onOpenRecord t1 t2
-      | isQTHigher t1 && isQTLower  t2 = onOpenRecord t1 t2
-      | _ = unifyErr t1 t2 "record-combination"
+    unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
+      -- Check for correct subtyping
+      if checkSubtypes subtypeOf t1 t2 then onOpenRecord t1 t2
+      else unifyErr t1 t2 "record-subtyping"
+      where
+        (QTConst(QTRecord ids)) `subtypeOf` (QTConst(QTRecord ids')) = ids' `subsetOf` ids
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
@@ -569,6 +565,8 @@ unifyDrv preF postF qt1 qt2 = do
 
     -- TODO: support non-subtype ie. widening
     -- TODO: Also support any order of annotations
+    -- Collection types cannot be widened ie. we don't have a way of merging 2 collections
+    -- if they don't match up in subtyping.
     unifyDrv' t1@(tag -> QTConst (QTCollection idsA)) t2@(tag -> QTConst (QTCollection idsB))
         | idsA `subsetOf` idsB = onCollectionPair idsB t1 t2
         | idsB `subsetOf` idsA = onCollectionPair idsA t1 t2
@@ -597,6 +595,22 @@ unifyDrv preF postF qt1 qt2 = do
           invalid = [QTMutable, QTImmutable]
       if invalid `subsetOf` annAB then unifyErr x y "mutability-annotations"
       else return annAB
+
+    -- Check if we meet subtyping criteria
+    -- subF is the way we check one type is a subtype of the other
+    checkSubtypes subF x y =
+      case (x, y) of
+        -- Lower and higher combinations should only occur once our lower and higher types
+        -- are fully formed. Therefore, we can check for bad subtyping there too
+        (QTLower l l', QTLower r r') -> r' `subMaybe` l && l' `subMaybe` r
+        -- Cases with regular types are always checked for subtyping constraints
+        (QTLower l l', r)            -> r `subMaybe` l  && l' `subMaybe` r
+        (l, QTLower r r')            -> l `subMaybe` r  && r' `subMaybe` l
+        (l, r)                       -> l == r
+      where
+        _       `subMaybe` Nothing = True
+        Nothing `subMaybe` _       = True
+        x       `subMaybe` y       = x `subF` y
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller

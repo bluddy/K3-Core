@@ -24,8 +24,9 @@ data QPType = QPType [QTVarId] (K3 QType)
 
 data QType
         = QTBottom
-        | QTLower     QType  -- covariant. Can only have record or number
-        | QTHigher    QType  -- contravariant
+        -- 1. lower bound (lowest supertype that must be supported)
+        -- 2. upper bound (highest subtype that must be supported)
+        | QTLower (Maybe QType) (Maybe QType)
         | QTPrimitive QTBase
         | QTConst     QTData
         | QTVar       QTVarId
