@@ -329,13 +329,11 @@ varsIn t = IntSet.toList $ runIdentity $ foldMapTree extractVars Set.empty t
 -- First, get the last tvar v points to
 -- Either any of the children of t have this tvar, or a QTVar in t links to this tvar
 occurs :: QTVarId -> K3 QType -> TVBEnv -> Bool
-occurs v t env =
+occurs v t env = loop t
   -- Follow v to the last tvar available
-  let v' = maybe v id $ fst $ tvchasev env v
-  in loop t
   where
     loop (QTConst _) = or $ map loop $ children t
-    loop (QTVar v2)  | v' == v2  = True
+    loop (QTVar v2)  | v == v2   = True
                      | otherwise = maybe False loop $ tvblkup tvbe v2
     loop _           = False
 
@@ -410,12 +408,6 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
       (QTCon (QTCollection idsA), QTCon (QTCollection idsB))
         | idsA `subsetOf` idsB -> mergedCollection idsB a' b'
         | idsB `subsetOf` idsA -> mergedCollection idsA a' b'
-
-    -- Free variables. Will be connected by unification
-    tvlower' x@(QTVar _) (QTVar _) = return x
-    -- TODO: check the next 2 carefully
-    tvlower' x@(QTVar _) _  = return x
-    tvlower' _ y@(QTVar _)  = return y
 
     mergedCollection annIds ct1 ct2 = do
        -- run tvlower on the record of the element type
