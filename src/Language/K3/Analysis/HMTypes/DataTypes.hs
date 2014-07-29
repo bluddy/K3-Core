@@ -198,6 +198,9 @@ tnum = tprim QTNumber
 tlowernum :: K3 QType
 tlowernum = QTLower $ tprim QTNumber
 
+thighernum :: K3 QType
+thighernum = QTHigher $ tprim QTNumber
+
 tunit :: K3 QType
 tunit = ttup []
 

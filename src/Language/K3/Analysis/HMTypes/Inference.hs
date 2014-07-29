@@ -402,26 +402,6 @@ tvsub qt = mapTree (sub IntSet.fromList vidl) qt
 tvlower :: K3 QType -> K3 QType -> TInfM (K3 QType)
 tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
   where
-    loop a b = tvlower' (tvchase tvbe a) (tvchase tvbe b)
-
-    tvlower' x@(tag -> QTPrimitive p1) y@(tag -> QTPrimitive p2)
-      | [p1, p2] `subsetOf` [QTReal, QTInt, QTNumber] =
-        -- Union of all annotations but mutability
-        annLower x y >>=
-        -- Find lowest common primitive type, and add combined annotations
-          return . foldl (@+) (tprim $ qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1,p2])
-      | p1 == p2 = return x
-
-    -- Open record types on both sides: widen to widest type
-    tvlower' x@(QTLower(QTConst (QTRecord ids))) y@(QTLower(QTConst (QTRecord ids'))) =
-        mergedRecord True ids x ids' y
-
-    -- Open record and closed record. Widen to closed record if it matches
-    tvlower' x@((QTConst (QTRecord ids)) y@(QTLower(QTConst (QTRecord ids')))
-      | ids' `subsetOf` ids  = mergedRecord False ids x ids' y
-    tvlower' x@((QTLower(QTConst (QTRecord ids))) y@(QTConst (QTRecord ids'))
-      | ids  `subsetOf` ids' = mergedRecord False ids x ids' y
-
 
      -- TODO: collections: do we need open/closed collection types?
       (QTCon (QTCollection _), QTCon (QTRecord _)) -> coveringCollection a' b'
@@ -436,38 +416,6 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
     -- TODO: check the next 2 carefully
     tvlower' x@(QTVar _) _  = return x
     tvlower' _ y@(QTVar _)  = return y
-
-      -- Closed record types: only if they match 100%
-      -- We iterate over their children
-    tvlower' x@(QTConst (QTRecord ids)) y@QTConst (QTRecord ids')) | x == y = do
-      let (idts, idts') = (zip ids $ children x, zip ids' $ children y)
-      ch <- mapM (\(k,v) -> loop v $ lookup k idts') idts
-      annlower qt1 qt2 >>=
-        return . foldl (@+) (tdata d ch)
-
-    -- handle tuples and other constructors: if they match, we iterate over their children
-    tvlower' x@(QTConst d) y@(QTConst _) | x == y = do
-      ch <- mapM (uncurry loop) $ zip (children x) (children y)
-      annlower x y >>=
-        return . foldl (@+) (tdata d ch)
-
-    -- other primitives are ok if they match
-    tvlower' x y | x == y = x
-
-    -- no match on both sides means a mismatch
-    tvlower' x y = lowerError x y
-
-    mergedRecord lower ids1 qt1 ids2 qt2 = do
-      let commonIds = ids1 `intersect` ids2
-          diffIds   = ids1 ++ ids2 `difference` inter
-          idts1     = zip ids1 $ children qt1
-          idts2     = zip ids2 $ children qt2
-          extras    = map (flip lookup idts1) diffIds ++ map (flip lookup idts2) diffIds
-          makeRec   = if lower then tlowerrec else trec
-
-      fieldQt <- mapM (\k -> loop (lookup k idts1) (lookup k idts2)) commonIds
-      annLower qt1 qt2 >>=
-        return . foldl (@+) (makeRec $ zip commonIds fieldQt ++ zip diffIds extras)
 
     mergedCollection annIds ct1 ct2 = do
        -- run tvlower on the record of the element type
@@ -571,7 +519,13 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
 
     -- numeric type: get lower bound
-    unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True) = tvlower t1 t2
+    unifyDrv' p1@(isQTNumeric -> True) p2@(isQTNumeric -> True)
+      | p1 == p2  = return x
+      | otherwise =
+          -- Find lowest common primitive type, and add combined annotations
+          let base = qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1, p2]
+          in unifyAnno x y >>=
+            return . foldl (@+) $ recreateOpen p1 p2 base
 
     -- other primitives have to match
     unifyDrv' t1@(tag -> QTPrimitive p1) (tag -> QTPrimitive p2)
@@ -599,16 +553,16 @@ unifyDrv preF postF qt1 qt2 = do
     -- | Open Record and closed record combinations
     unifyDrv' t1@(getQTRecordIds -> Just f1) t2@(getQTRecordIds -> Just f2)
       -- Check for correct subtyping in some cases
-      | isQTLower t1  && isQTClosed t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
-      | isQTClosed t1 && isQTLower t2  && f2 `subsetOf` f1 = onOpenRecord t1 t2
+      | isQTLower  t1 && isQTClosed t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
+      | isQTClosed t1 && isQTLower  t2 && f2 `subsetOf` f1 = onOpenRecord t1 t2
       | isQTClosed t1 && isQTHigher t2 && f1 `subsetOf` f2 = onOpenRecord t1 t2
       | isQTHigher t1 && isQTClosed t2 && f2 `subsetOf` f1 = onOpenRecord t1 t2
-      | isQTLower t1  && isQTLower t2  = onOpenRecord t1 t2
+      | isQTLower  t1 && isQTLower  t2 = onOpenRecord t1 t2
       | isQTHigher t1 && isQTHigher t2 = onOpenRecord t1 t2
-      | isQTLower t1  && isQTHigher t2 = onOpenRecord t1 t2
-      | isQTHigher t1 && isQTLower t2  = onOpenRecord t1 t2
+      | isQTLower  t1 && isQTHigher t2 = onOpenRecord t1 t2
+      | isQTHigher t1 && isQTLower  t2 = onOpenRecord t1 t2
       | _ = unifyErr t1 t2 "record-combination"
-    
+
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
     unifyDrv' t1@(tag -> QTConst (QTCollection _)) t2@(isQTRecord -> True)
@@ -644,12 +598,13 @@ unifyDrv preF postF qt1 qt2 = do
     -- recurse unifyDrv
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
     rcr a b = unifyDrv preF postF a b
-    
+
     -- Join annotations together for except for mutability contradiction
-    unifyAnno x@(annotations -> annA) y@(annotations -> annB) =
+    unifyAnno x@(annotations -> annA) y@(annotations -> annB) = do
       let annAB   = nub $ annA ++ annB
           invalid = [QTMutable, QTImmutable]
-      in if invalid `subsetOf` annAB then unifyErr x y "mutability-annotations" else return annAB
+      if invalid `subsetOf` annAB then unifyErr x y "mutability-annotations"
+      else return annAB
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller
@@ -684,18 +639,22 @@ unifyDrv preF postF qt1 qt2 = do
       -- Recurse on the common children, unifying them
       commonCh <- mapM (uncurry rcr) $ zip lch rch
       -- Create a new record
-      let record = recreateRecord (tag lt) (tag rt) $
+      let record = recreateOpen (tag lt) (tag rt) trec $
                 zip (commonIds ++ diffIds) $ commonCh ++ diffCh
-      return fold (@+) record $ unifyAnnos lt rt
+      unifyAnno lt rt >>=
+        return . fold (@+) record
+      -- TODO: widen the original varids
 
       where
         matchChildren idgroup idl n = shuffleNamedPairs idgroup $ zip idl $ children n
 
-        -- recreate a result record
-        -- TODO: handle highers distinctly
-        recreateRecord (isQTClosed -> True) _ idvs = trec idvs
-        recreateRecord _ (isQTClosed -> True) idvs = trec idvs
-        recreateRecord _ _ idvs = tlowerrec idvs
+    -- recreate a result open type, based on incoming types
+    -- TODO: handle highers distinctly
+    recreateOpen :: QType -> QType ->
+    recreateOpen (isQTClosed -> True) _ const x = f x
+    recreateOpen _ (isQTClosed -> True) constf x = f x
+    recreateOpen _ _ const x = let (Node t ch) = const x in
+                               Node (QTLower t) ch
 
     -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)
