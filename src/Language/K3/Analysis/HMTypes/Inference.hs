@@ -530,26 +530,16 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
-    -- | Closed records must agree 100%
-    --   Our comparison already takes care of id order at the top level
-    --   We need to make sure that we recurse in the right order
-    unifyDrv' n1@(tag -> QTConst d1@(QTRecord f1))
-              n2@(tag -> QTConst d2@(QTRecord f2))
-      | n1 == n2 =
-        -- Arrange both sides by order of first record
-        let ch2 = shuffleNamedPairs f1 (zip f2 $ children n2)
-            recCtor nch = trec (zip f1 nch)
-        in onChildren d1 d2 "closed-records" (children n1) ch2 recCtor
-
-      | otherwise = unifyErr n1 n2 "closed-records"
-
-    -- | Open Record and closed record combinations
+    -- | Record combinations
     unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
       -- Check for correct subtyping
       if checkSubtypes subtypeOf t1 t2 then onOpenRecord t1 t2
       else unifyErr t1 t2 "record-subtyping"
       where
+        -- subtype function for record-record
         (QTConst(QTRecord ids)) `subtypeOf` (QTConst(QTRecord ids')) = ids' `subsetOf` ids
+        -- should never happen
+        x `subtypeOf` y = error "expected records but got ["++show x++"], ["++show y++"]"
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
@@ -636,6 +626,12 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
+    -- If we have lower and lower, we unify the common subset, and add the difference
+    -- Will also work for closed and closed, closed and lower, lower and closed
+    -- For higher and higher, we unify the common subset and drop the difference
+    -- For higher and lower, we just place them together
+    -- For 2 highers and lowers, we do both actions on the corresponding matches
+    -- For lambdas, we shouldn't widen at all
     onOpenRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
       let allIds = ids ++ ids'
           commonIds = ids `intersection` ids'
