@@ -96,7 +96,9 @@ projectNamedPairs ids idv = snd $ unzip $ filter (\(k,_) -> k `elem` ids) idv
 
 -- Rearrange named pairs according to identifier list
 shuffleNamedPairs :: [Identifier] -> [(Identifier, a)] -> [a]
-shuffleNamedPairs ids idv = map (flip lookup idv) ids
+shuffleNamedPairs ids idv =
+  let m = HashMap.fromList idv
+  in map (flip HashMap.lookup m) ids
 
 -- Replace matching values in newIds newVs if there's an id match
 rebuildNamedPairs :: [(Identifier, a)] -> [Identifier] -> [a] -> [a]
@@ -291,6 +293,12 @@ intersection a b = HashSet.toList $ HashSet.fromList a `HashSet.intersect` HashS
 
 difference :: [a] -> [a] -> [a]
 difference a b = HashSet.toList $ HashSet.fromList a HashSet.\\ HashSet.fromList b
+
+-- Get the complete difference between 2 sets
+diff2way :: [a] -> [a] -> [a]
+diff2way a b =
+  let (a', b') = (HashSet.fromList a, HashSet.fromList b)
+  in HashSet.toList $ (a' HashSet.\\ b') `HashSet.union` (b' HashSet.\\ a')
 
 -- Give the set of all type variables that are allocated in TVE but
 -- not bound there
@@ -600,7 +608,7 @@ unifyDrv preF postF qt1 qt2 = do
       where
         _       `subMaybe` Nothing = True
         Nothing `subMaybe` _       = True
-        x       `subMaybe` y       = x `subF` y
+        Just x  `subMaybe` Just y  = x `subF` y
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller
@@ -626,36 +634,63 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
+    -- General function to combine subtypes
+    -- closedF, lowerF, upperF: functions to combine closed types (or closed + lower/upper),
+    -- lower types, and upper types, respectively
+    combineSubTypes closedF lowerF upperF x y =
+      case (x, y) of
+        (QTLower l l', QTLower r r') -> do
+        -- Cases with only open types: we extend both the lower and upper limits,
+        -- if they exist
+          v  <- doMaybe lowerF l r
+          v' <- doMaybe upperF l' r'
+          return $ QTLower v v'
+        -- Cases with closed types: unify with both higher and lower
+        -- Return whichever one isn't nothing
+        (QTLower l l', r) -> closedOpen r l l'
+        (l, QTLower r r') -> closedOpen l r r'
+        (l, r)            -> closedF l r
+      where
+        doMaybe _ (Just x) Nothing  = return Nothing
+        doMaybe _ Nothing (Just y)  = return Nothing
+        doMaybe f (Just x) (Just y) = f x y
+
+        closedOpen l r r' = do
+          v' <- doMaybe closedF l r' -- unify with higher first
+          v  <- doMaybe closedF l r
+          -- If both unify, doesn't matter which one we return
+          return $ maybe (maybe Nothing id v) id v'
+
+    onOpenCollection lt@(getQTCollectionIds -> ids) rt@(getQTCollectionIds -> ids') = do
+
     -- If we have lower and lower, we unify the common subset, and add the difference
     -- Will also work for closed and closed, closed and lower, lower and closed
     -- For higher and higher, we unify the common subset and drop the difference
     -- For higher and lower, we just place them together
     -- For 2 highers and lowers, we do both actions on the corresponding matches
     -- For lambdas, we shouldn't widen at all
-    onOpenRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
-      let allIds = ids ++ ids'
+    onOpenRecord action lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
+      let allIdCh = zip (ids ++ ids') $ children lt ++ children rt
           commonIds = ids `intersection` ids'
-          diffIds = allIds `difference` commonIds
-          (lch, rch) = (matchChildren commonIds ids lt, matchChildren commonIds ids' rt)
-          diffCh = shuffleNamedPairs diffIds $ zip allIds $ children lt ++ children rt
+          diffIds = ids `diff2way` ids'
+          (lIds, rIds) = (ids `difference` ids', ids' `difference` ids)
+          commonlch = shuffleNamedPairs commonIds $ zip ids  $ children lt
+          commonrch = shuffleNamedPairs commonIds $ zip ids' $ children rt
+          diffCh = shuffleNamedPairs diffIds allIdCh
       -- Recurse on the common children, unifying them
-      commonCh <- mapM (uncurry rcr) $ zip lch rch
+      commonCh <- mapM (uncurry rcr) $ zip commonlch commonrch
       -- Create a new record
       let record = recreateOpen (tag lt) (tag rt) trec $
-                zip (commonIds ++ diffIds) $ commonCh ++ diffCh
-      unifyAnno lt rt >>=
-        return . fold (@+) record
+                     zip (commonIds ++ diffIds) $ commonCh ++ diffCh
+      unifyAnno lt rt >>= return . fold (@+) record
       -- TODO: widen the original varids
-
-      where
-        matchChildren idgroup idl n = shuffleNamedPairs idgroup $ zip idl $ children n
 
     -- recreate a result open type, based on incoming types
     -- TODO: handle highers distinctly
     recreateOpen :: QType -> QType ->
-    recreateOpen (isQTClosed -> True) _ const x = f x
+    recreateOpen (isQTClosed -> True) _ constf x = f x
     recreateOpen _ (isQTClosed -> True) constf x = f x
-    recreateOpen _ _ const x = let (Node t ch) = const x in
+    recreateOpen _ _ constf x = let (Node t ch) = constf x in
                                Node (QTLower t) ch
 
     -- If types are equal, recurse unify on their children
