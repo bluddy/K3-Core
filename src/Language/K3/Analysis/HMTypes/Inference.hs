@@ -397,7 +397,7 @@ tvsub qt = mapTree (sub IntSet.fromList vidl) qt
     sub _ _ t = return t
 
     -- Add to tdest all the annotations of tsrc
-    extendAnns tsrc tdest = return $ foldl (@+) tdest $
+    extendAnns tsrc tdest = return $ foldl' (@+) tdest $
                               annotations tdest `difference` annotations tsrc
 
 -- | Lower bound computation for numeric and record types.
@@ -421,7 +421,7 @@ tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
        -- run tvlower on the record of the element type
        ctntLower <- tvlower (head $ children ct1) (head $ children ct2)
        annLower ct1 ct2 >>=
-         return . foldl (@+) (tcol ctntLower annIds)
+         return . foldl' (@+) (tcol ctntLower annIds)
 
     -- Merge collection and record that fits it
     -- NOTE: this shouldn't be necessary. We can type as if collections
@@ -494,7 +494,7 @@ unifyv v t = do
     injectSelfQt tvbe qt = mapTree (inject tvbe) qt
 
     inject tvbe nch n@(tvchase tvbe -> Node (QTLower (QTCon (QTRecord _)) :@: anns) _)
-      | occurs v n tbve = return $ foldl (@+) tself anns
+      | occurs v n tbve = return $ foldl' (@+) tself anns
       | otherwise = return $ Node (tag n :@: anns) nch
 
     inject _ ch n = return $ Node (tag n :@: annotations n) ch
@@ -519,14 +519,34 @@ unifyDrv preF postF qt1 qt2 = do
   where
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
 
-    -- numeric type: get lower bound
-    unifyDrv' p1@(isQTNumeric -> True) p2@(isQTNumeric -> True)
+    -- numeric type: deal with subtyping
+    unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True)
+      if checkSubtypes subtypeOf t1 t2 then
+        combineSubtypes closed lower upper t1 t2
+      else unifyErr t1 t2 "numeric-subtyping"
+      where
+        subtypeOf (QTPrimitive x) (QTPrimitive y) = qtEnumOfBase x <= qtEnumOfBase y
+        subtypeOf x y = error $ "expected numbers but got ["++show x++"], ["++show y++"]"
+
+        closed (getQTNumeric -> x) (getQTNumeric -> y) =
+          unifyAnno x y >>=
+            return . foldl' (@+) $ qtBaseOfEnum $ minimum $ qtEnumOfBase [x, y]
+
+        lower  (getQTNumeric -> x) (getQTNumeric -> y) =
+          unifyAnno x y >>=
+            return . foldl' (@+) $ qtBaseOfEnum $ minimum $ qtEnumOfBase [x, y]
+
+        upper  (getQTNumeric -> x) (getQTNumeric -> y) =
+          qtBaseOfEnum $ maximum $ qtEnumOfBase [x, y]
+
+
+
       | p1 == p2  = return x
       | otherwise =
           -- Find lowest common primitive type, and add combined annotations
           let base = qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1, p2]
           in unifyAnno x y >>=
-            return . foldl (@+) $ recreateOpen p1 p2 base
+            return . foldl' (@+) $ recreateOpen p1 p2 base
 
     -- other primitives have to match
     unifyDrv' t1@(tag -> QTPrimitive p1) (tag -> QTPrimitive p2)
@@ -534,20 +554,25 @@ unifyDrv preF postF qt1 qt2 = do
       | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
     -- | Self type unification
-    --   TODO: We don't know which collection self refers to. Any way we can fix that?
+    --   TODO: Fix self type so we know which self is referred to
     unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
 
     -- | Record combinations
     unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
       -- Check for correct subtyping
-      if checkSubtypes subtypeOf t1 t2 then onOpenRecord t1 t2
+      if checkSubtypes subtypeOf t1 t2 then
+        combineSubtypes closed lower upper t1 t2
       else unifyErr t1 t2 "record-subtyping"
       where
         -- subtype function for record-record
-        (QTConst(QTRecord ids)) `subtypeOf` (QTConst(QTRecord ids')) = ids' `subsetOf` ids
+        subtypeOf (QTConst(QTRecord ids)) (QTConst(QTRecord ids')) = ids' `subsetOf` ids
         -- should never happen
-        x `subtypeOf` y = error "expected records but got ["++show x++"], ["++show y++"]"
+        subtypeOf x y = error $ "expected records but got ["++show x++"], ["++show y++"]"
+
+        closed = combineRecords $ frec . const
+        lower  = combineRecords $ flowerrec . (++)
+        upper  = combineRecords $ fhigherrec . const
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
@@ -587,7 +612,7 @@ unifyDrv preF postF qt1 qt2 = do
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
     rcr a b = unifyDrv preF postF a b
 
-    -- Join annotations together for except for mutability contradiction
+    -- Join annotations together except for mutability contradiction
     unifyAnno x@(annotations -> annA) y@(annotations -> annB) = do
       let annAB   = nub $ annA ++ annB
           invalid = [QTMutable, QTImmutable]
@@ -609,6 +634,33 @@ unifyDrv preF postF qt1 qt2 = do
         _       `subMaybe` Nothing = True
         Nothing `subMaybe` _       = True
         Just x  `subMaybe` Just y  = x `subF` y
+
+    -- General function to combine subtypes
+    -- closedF, lowerF, upperF: functions to combine closed types (or closed + lower/upper),
+    -- lower types, and upper types, respectively
+    combineSubtypes closedF lowerF upperF x y =
+      case (x, y) of
+        (QTLower l l', QTLower r r') -> do
+        -- Cases with only open types: we extend both the lower and upper limits,
+        -- if they exist
+          v  <- doMaybe lowerF l r
+          v' <- doMaybe upperF l' r'
+          return $ QTLower v v'
+        -- Cases with closed types: unify with both higher and lower
+        -- Return whichever one isn't nothing
+        (QTLower l l', r) -> closedWithOpen r l l'
+        (l, QTLower r r') -> closedWithOpen l r r'
+        (l, r)            -> closedF l r
+      where
+        doMaybe _ (Just x) Nothing  = return Nothing
+        doMaybe _ Nothing (Just y)  = return Nothing
+        doMaybe f (Just x) (Just y) = f x y
+
+        closedWithOpen l r r' = do
+          v' <- doMaybe closedF l r' -- unify with higher first
+          v  <- doMaybe closedF l r
+          -- If both unify, doesn't matter which one we return
+          return $ maybe (maybe Nothing id v) id v'
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller
@@ -634,56 +686,24 @@ unifyDrv preF postF qt1 qt2 = do
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
-    -- General function to combine subtypes
-    -- closedF, lowerF, upperF: functions to combine closed types (or closed + lower/upper),
-    -- lower types, and upper types, respectively
-    combineSubTypes closedF lowerF upperF x y =
-      case (x, y) of
-        (QTLower l l', QTLower r r') -> do
-        -- Cases with only open types: we extend both the lower and upper limits,
-        -- if they exist
-          v  <- doMaybe lowerF l r
-          v' <- doMaybe upperF l' r'
-          return $ QTLower v v'
-        -- Cases with closed types: unify with both higher and lower
-        -- Return whichever one isn't nothing
-        (QTLower l l', r) -> closedOpen r l l'
-        (l, QTLower r r') -> closedOpen l r r'
-        (l, r)            -> closedF l r
-      where
-        doMaybe _ (Just x) Nothing  = return Nothing
-        doMaybe _ Nothing (Just y)  = return Nothing
-        doMaybe f (Just x) (Just y) = f x y
-
-        closedOpen l r r' = do
-          v' <- doMaybe closedF l r' -- unify with higher first
-          v  <- doMaybe closedF l r
-          -- If both unify, doesn't matter which one we return
-          return $ maybe (maybe Nothing id v) id v'
-
-    onOpenCollection lt@(getQTCollectionIds -> ids) rt@(getQTCollectionIds -> ids') = do
-
-    -- If we have lower and lower, we unify the common subset, and add the difference
-    -- Will also work for closed and closed, closed and lower, lower and closed
-    -- For higher and higher, we unify the common subset and drop the difference
-    -- For higher and lower, we just place them together
-    -- For 2 highers and lowers, we do both actions on the corresponding matches
-    -- For lambdas, we shouldn't widen at all
-    onOpenRecord action lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
+    -- Return the common ids and different ids after unifying the common ids
+    onOpenRecord lt@(getQTRecordIds -> ids) rt@(getQTRecordIds -> ids') = do
       let allIdCh = zip (ids ++ ids') $ children lt ++ children rt
           commonIds = ids `intersection` ids'
           diffIds = ids `diff2way` ids'
-          (lIds, rIds) = (ids `difference` ids', ids' `difference` ids)
           commonlch = shuffleNamedPairs commonIds $ zip ids  $ children lt
           commonrch = shuffleNamedPairs commonIds $ zip ids' $ children rt
           diffCh = shuffleNamedPairs diffIds allIdCh
       -- Recurse on the common children, unifying them
       commonCh <- mapM (uncurry rcr) $ zip commonlch commonrch
-      -- Create a new record
-      let record = recreateOpen (tag lt) (tag rt) trec $
-                     zip (commonIds ++ diffIds) $ commonCh ++ diffCh
-      unifyAnno lt rt >>= return . fold (@+) record
-      -- TODO: widen the original varids
+      return (zip commonIds commonCh, zip diffIds diffCh)
+
+    -- Different ways to combine records, based on given function
+    combineRecords f l r = do
+      (common, diff) <- onOpenRecord l r
+      unifyAnno l r >>= return . foldl' (@+) $ f common diff
+
+    -- TODO: widen the original varids
 
     -- recreate a result open type, based on incoming types
     -- TODO: handle highers distinctly
@@ -753,7 +773,7 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
           void $ mapM_ (\v -> if occurs v qt tve then return ()
                               else unifyv v qt) vs
           return $ if null vs then qt
-                   else (foldl (@+) (tvar $ head vs) $ annotations qt)
+                   else (foldl' (@+) (tvar $ head vs) $ annotations qt)
 
 
 -- | Given a polytype, for every polymorphic type var, replace all of
@@ -1195,8 +1215,8 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       bqt <- qTypeOfM $ last ch
       case b of
         BIndirection i -> modify $ \env -> tidele env i
-        BTuple ids     -> modify $ \env -> foldl tidele env ids
-        BRecord ids    -> modify $ \env -> foldl tidele env $ map snd ids
+        BTuple ids     -> modify $ \env -> foldl' tidele env ids
+        BRecord ids    -> modify $ \env -> foldl' tidele env $ map snd ids
       return $ rebuildE n ch .+ bqt
 
     -- First child unification has already been performed in sidewaysBinding
@@ -1348,8 +1368,8 @@ qpType t@(tag -> TForall tvars) = do
       v <- newtv
       vId <- varId v
       return (id', vId)
-    extend tvmap env = foldl (\a (b,c) -> tiextdv a b c) env tvmap
-    prune  tvmap env = foldl (\a (b,_) -> tideldv a b) env tvmap
+    extend tvmap env = foldl' (\a (b,c) -> tiextdv a b c) env tvmap
+    prune  tvmap env = foldl' (\a (b,_) -> tideldv a b) env tvmap
     varId (tag -> QTVar i) = return i
     varId _ = left $ "Invalid type variable for type var bindings"
 
@@ -1460,7 +1480,7 @@ translateQType qt = mapTree translateWithMutability qt
         translateWithMutability ch qt' = translate ch qt'
 
         attachToChildren ch qt' =
-          map (uncurry $ foldl (@+)) $ zip ch $ map (map translateAnnotation . annotations) $ children qt'
+          map (uncurry $ foldl' (@+)) $ zip ch $ map (map translateAnnotation . annotations) $ children qt'
 
         translateAnnotation a = case a of
           QTMutable   -> TMutable
@@ -1490,7 +1510,7 @@ translateQType qt = mapTree translateWithMutability qt
           QTIndirection       -> return $ TC.indirection $ head ch
           QTTuple             -> return $ TC.tuple ch
           QTRecord        ids -> return $ TC.record $ zip ids ch
-          QTCollection annIds -> return $ foldl (@+) (TC.collection $ head ch) $ map TAnnotation annIds
+          QTCollection annIds -> return $ foldl' (@+) (TC.collection $ head ch) $ map TAnnotation annIds
           QTTrigger           -> return $ TC.trigger $ head ch
           QTSource            -> return $ TC.source $ head ch
           QTSink              -> return $ TC.sink $ head ch
@@ -1526,7 +1546,7 @@ instance Pretty (QPType, Bool) where
   prettyLines (a,b) = (if b then ["(Lifted) "] else ["(Attr) "]) %+ prettyLines a
 
 prettyPairList :: (Show a, Pretty b) => [(a,b)] -> [String]
-prettyPairList l = foldl (\acc kvPair -> acc ++ prettyPair kvPair) [] l
+prettyPairList l = foldl' (\acc kvPair -> acc ++ prettyPair kvPair) [] l
 
 prettyPair :: (Show a, Pretty b) => (a,b) -> [String]
 prettyPair (a,b) = [show a ++ " => "] %+ prettyLines b

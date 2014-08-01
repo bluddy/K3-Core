@@ -24,8 +24,10 @@ data QPType = QPType [QTVarId] (K3 QType)
 
 data QType
         = QTBottom
+        -- QTOpen children:
         -- 1. lower bound (lowest supertype that must be supported)
         -- 2. upper bound (highest subtype that must be supported)
+        -- Any missing bounds are replaced with QTBottom
         | QTLower (Maybe QType) (Maybe QType)
         | QTPrimitive QTBase
         | QTConst     QTData
@@ -216,12 +218,17 @@ isQTUID (QTUID _) = True
 isQTUID _ = False
 
 isQTNumeric :: K3 QType -> Bool
-isQTNumeric (tag -> QTPrimitive _ QTInt)    = True
-isQTNumeric (tag -> QTPrimitive _ QTReal)   = True
-isQTNumeric (tag -> QTPrimitive _ QTNumber) = True
-isQTNumeric (tag -> QTLower t)  = isQTNumeric t
-isQTNumeric (tag -> QTHigher t) = isQTNumeric t
+isQTNumeric (tag -> QTPrimitive QTInt)    = True
+isQTNumeric (tag -> QTPrimitive QTReal)   = True
+isQTNumeric (tag -> QTPrimitive QTNumber) = True
+isQTNumeric (tag -> QTLower t _)  = isQTNumeric t
 isQTNumeric _ = False
+
+getQTNumeric (tag -> QTPrimitive QTInt)    = Just QTInt
+getQTNumeric (tag -> QTPrimitive QTReal)   = Just QTReal
+getQTNumeric (tag -> QTPrimitive QTNumber) = Just QTNumber
+getQTNumeric (tag -> QTLower t) = getQTNumeric t
+getQTNumeric _ = Nothing
 
 isQTVar :: K3 QType -> Bool
 isQTVar (tag -> QTVar _) = True
