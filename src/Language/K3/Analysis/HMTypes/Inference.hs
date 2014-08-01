@@ -13,11 +13,10 @@
 --   http://okmij.org/ftp/Computation/FLOLAC/TInfLetP.hs
 --
 
--- TODO: add uids to type variables
+-- TODO: add uids to type variables and print them
 -- TODO: deal with contravariance for functions passed in
--- TODO: basic problem: breaking the pointers. Need to keep them until the end
 -- TODO: keep most varids one level deep (pointing to another id that has a type) to improve performance
--- NOTE: between lambda borders, we want to unify without forcing lowerbound expansion of types
+-- TODO: between lambda borders, we want to unify without forcing lowerbound expansion of types
 --       and keep track of the connection for concretization
 
 module Language.K3.Analysis.HMTypes.Inference where
@@ -340,6 +339,7 @@ occurs :: QTVarId -> K3 QType -> TVBEnv -> Bool
 occurs v t env = loop t
   -- Follow v to the last tvar available
   where
+    loop QTOpen      = or $ map loop $ children t
     loop (QTConst _) = or $ map loop $ children t
     loop (QTVar v2)  | v == v2   = True
                      | otherwise = maybe False loop $ tvblkup tvbe v2
@@ -383,7 +383,6 @@ newtv muid mspan = do
 -- NOTE: deep substitution breaks links between types
 --       Make sure not to break links for lowers or highers
 --       We should not do it until the VERY end
-
 tvsub ::  K3 QType -> TInfM (K3 QType)
 tvsub qt = modifyTree sub qt
   where
@@ -417,20 +416,23 @@ tvreplace dict qt = modifyTree sub qt
 
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
---   a collection and a record that is a subtype of the collection.
---   Collections are also records because you can project on them (lifted attributes)
+--   a collection and a record that is a hacky subtype of said collection.
+--   This is hacky because we only check that the records match the collection at the
+--   id level. Collections are records because you can project on them.
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
-collectionSubRecord ct@(tag -> QTConst (QTCollection annIds))
-                       (getQTRecordIds -> Just ids)
+collectionSubRecord ct@(getQTCollectionIds -> Just annIds)
+                       (getQTRecordIds     -> Just ids)
   = get >>= mkColQT >>= return . testF
   where
     mkColQT tienv = do
       -- Get collection member environments for all annotations
       memEnvs <- mapM (liftEitherM . tilkupa tienv) annIds
       -- Make final and self types
-      mkCollectionFSQType annIds memEnvs (last $ children ct)
+      -- We don't care about the final type though
+      mkCollectionFSQType annIds memEnvs $ head $ children ct
 
-    -- Check that the created record matches the record ids
+    -- Hack: check that the created record matches the record ids
+    -- No deep check here
     testF (_, self)
       | QTConst (QTRecord liftedAttrIds) <- tag self
       , ids `subsetOf` liftedAttrIds
@@ -459,16 +461,16 @@ unifyv v t = do
   else do
     -- Recursive unification. Can only be for self
     -- Inject self into every record type in the type
-    -- Why isn't a collection handled here? Do we just assume that recursion
-    -- can only work in collection self types?
+    -- TODO: Check: is this ever activated?
     qt' <- injectSelfQt tve t
     trace (prettyTaggedSPair "unifyv yoc" v qt') $
       modify $ modTvarEnv $ \tvbe' -> tvbext tvbe' v qt'
 
   where
+    -- Replace all records that contain v with self
     injectSelfQt tvbe qt = mapTree (inject tvbe) qt
 
-    inject tvbe nch n@(tvchase tvbe -> Node (QTLower (QTCon (QTRecord _)) :@: anns) _)
+    inject tvbe nch n@(isQTRecord . tvchase -> True)
       | occurs v n tbve = return $ foldl' (@+) tself anns
       | otherwise = return $ Node (tag n :@: anns) nch
 
@@ -496,7 +498,7 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
 
     -- numeric type: deal with subtyping
-    unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True)
+    unifyDrv' t1@(isQTNumeric -> True) t2@(isQTNumeric -> True) =
       if checkSubtypes subtypeOf t1 t2 then
         combineSubtypes closed lower upper t1 t2
       else unifyErr t1 t2 "numeric-subtyping"
@@ -523,7 +525,7 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' (tag -> QTSelf) t2@(isQTCollection -> True) = return t2
 
     -- | Record combinations with subtyping
-    unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
+    unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True) =
       -- Check for correct subtyping
       if checkSubtypes subtypeOf t1 t2 then
         combineSubtypes closed lower upper t1 t2
@@ -540,26 +542,25 @@ unifyDrv preF postF qt1 qt2 = do
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
-    --   NOTE: Hacky. We don't really check for a unification. We only
-    --         match on the ids
-    unifyDrv' t1@(tag -> QTConst (QTCollection _)) t2@(isQTRecord -> True)
+    --   NOTE: Hacky. We don't really check for a unification. We only match on the ids
+    unifyDrv' t1@(isQTCollection -> True) t2@(isQTRecord -> True)
       = collectionSubRecord t1 t2 >>= \case
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t1 t2
           _ -> unifyErr t1 t2 "collection-record" ""
 
-    unifyDrv' t1@(isQTRecord -> True) t2@(tag -> QTConst (QTCollection _))
+    unifyDrv' t1@(isQTRecord -> True) t2@(isQTCollection -> True)
       = collectionSubRecord t2 t1 >>= \case
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t2 t1
           _ -> unifyErr t1 t2 "collection-record" ""
 
-    -- | Collection combinations
-    unifyDrv' t1@(isQTCollection -> True) t2@(isQTCollection -> True)
+    -- | Collection subtyping
+    unifyDrv' t1@(isQTCollection -> True) t2@(isQTCollection -> True) =
       -- Check for correct subtyping
       if checkSubtypes subtypeOf t1 t2 then
         combineSubtypes closed lower upper t1 t2
       else unifyErr t1 t2 "collection-subtyping"
       where
-        -- subtype function for record-record
+        -- subtype function for collection-collection
         subtypeOf (QTConst(QTCollection ids)) (QTConst(QTCollection ids')) = ids' `subsetOf` ids
         -- should never happen
         subtypeOf x y = error $ "expected collections but got ["++show x++"], ["++show y++"]"
@@ -601,8 +602,8 @@ unifyDrv preF postF qt1 qt2 = do
         -- are fully formed. Therefore, we can check for bad subtyping there too
         (Node QTOpen [l, l'], Node QTOpen [r, r']) -> r' `subMaybe` l && l' `subMaybe` r
         -- Cases with regular types are always checked for subtyping constraints
-        (Node QTLower [l,l'], r)                   -> r `subMaybe` l  && l' `subMaybe` r
-        (l, Node QTLower [r, r'])                  -> l `subMaybe` r  && r' `subMaybe` l
+        (Node QTOpen [l,l'], r)                    -> r `subMaybe` l  && l' `subMaybe` r
+        (l, Node QTOpen [r, r'])                   -> l `subMaybe` r  && r' `subMaybe` l
         (l, r)                                     -> l == r
       where
         _        `subMaybe` QTBottom = True
@@ -614,7 +615,7 @@ unifyDrv preF postF qt1 qt2 = do
     -- lower types, and upper types, respectively
     combineSubtypes closedF lowerF upperF x y =
       case (x, y) of
-        (Node QTLower [l,l'], Node QTLower [r,r']) -> do
+        (Node QTOpen [l,l'], Node QTOpen [r,r']) -> do
         -- Cases with only open types: we extend both the lower and upper limits,
         -- if they exist
           v  <- doMaybe lowerF l r
@@ -639,13 +640,7 @@ unifyDrv preF postF qt1 qt2 = do
           return $ if isQTBottom v' then v
                    else v'
 
-    -- recurse on the pair of content of each collection
-    -- Annotations are taken care of by caller
-    onCollectionPair :: [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
-    onCollectionPair annIds t1 t2 = rcr (head $ children t1) (head $ children t2) >>=
-                                      return . flip tcol annIds
-
-    -- Take a self type, list of attributes, collection type and record type, and
+        -- Take a self type, list of attributes, collection type and record type, and
     -- unify the record with the collection
     onCollection :: K3 QType -> [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
     onCollection selfQt liftedAttrIds
@@ -689,14 +684,6 @@ unifyDrv preF postF qt1 qt2 = do
         return . foldl' (@+) $ tcol ch' newIds
 
     -- TODO: widen the original varids
-
-    -- recreate a result open type, based on incoming types
-    -- TODO: handle highers distinctly
-    recreateOpen :: QType -> QType ->
-    recreateOpen (isQTClosed -> True) _ constf x = f x
-    recreateOpen _ (isQTClosed -> True) constf x = f x
-    recreateOpen _ _ constf x = let (Node t ch) = constf x in
-                               Node (QTLower t) ch
 
     -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)
@@ -783,8 +770,7 @@ instantiate (QPType tvs t) =
          -- Copy over uid and span
          tve <- getTVE
          let (muid, mspan) = tvlkup tve tv
-         tvfresh <- newtv muid mspan
-         return tvfresh
+         newtv muid mspan
 
 -- | Return a monomorphic polytype.
 monomorphize :: (Monad m) => K3 QType -> m QPType
@@ -793,18 +779,18 @@ monomorphize t = return $ QPType [] t
 -- | Generalization for let-polymorphism.
 generalize :: TInfM (K3 QType) -> TInfM QPType
 generalize ta = do
- tve_before <- getTVE
- t          <- ta
- tve_after  <- getTVE
- -- Check for free vars that have been captured after the action
- -- We need fvs in t that are not bound in the environment
- -- This is potentially a very expensive action
- let freeBefore = tvfree tve_before
-     tvdep = tvDependentSet freeBefore tve_after
- -- get the set of free vars
-     freeAfter = tvfree tve_after
-     fv  = filter (\x -> x `member` freeAfter && not $ tvdep x ) $ varsIn t
- return $ QPType fv t
+  tve_before <- getTVE
+  t          <- ta
+  tve_after  <- getTVE
+  -- Check for free vars that have been captured after the action
+  -- We need fvs in t that are not bound in the environment
+  -- This is potentially a very expensive action
+  let freeBefore = tvfree tve_before
+      tvdep = tvDependentSet freeBefore tve_after
+      -- get the set of free vars
+      freeAfter = tvfree tve_after
+      fv  = filter (\x -> x `member` freeAfter && not $ tvdep x ) $ varsIn t
+  return $ QPType fv t
 
  -- ^ We return an unsubstituted type to preserve type variables
  --   for late binding based on overriding unification performed
@@ -894,7 +880,8 @@ inferProgramTypes prog = do
     initExprF :: K3 Expression -> TInfM (K3 Expression)
     initExprF expr = return expr
 
-    unifyInitializer :: Identifier -> Either (Maybe QPType) QPType -> Maybe (K3 Expression) -> TInfM (Maybe (K3 Expression))
+    unifyInitializer :: Identifier -> Either (Maybe QPType) QPType ->
+                        Maybe (K3 Expression) -> TInfM (Maybe (K3 Expression))
     unifyInitializer n qptE eOpt = do
       qpt <- case qptE of
               Left (Nothing)   -> get >>= \env -> liftEitherM (tilkupe env n)
@@ -1256,10 +1243,9 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 {- Collection type construction -}
 
 -- Make a collection qtype based on the contents (always a record)
+-- NOTE: limits collection content to a record
 mkCollectionQType :: [Identifier] -> K3 QType -> TInfM (K3 QType)
-mkCollectionQType annIds contentQt@(tag -> QTCon (QTRecord _)) =
-  return $ tcol contentQt annIds
-mkCollectionQType annIds contentQt@(tag -> QTLower (QTCon (QTRecord _))) =
+mkCollectionQType annIds contentQt@(isQTRecord -> True) =
   return $ tcol contentQt annIds
 
 mkCollectionQType _ qt = left $ "Invalid content record type: " ++ show qt
@@ -1278,14 +1264,14 @@ mkCollectionFSQType annIds memEnvs contentQt = do
     flatEnvs <- assertNoDuplicateIds
     -- boolean determines if it's lifted
     let (lifted, regular) = partition (snd . snd) flatEnvs
-        (lifted', regular') = (removeBool lifted, removeBool regular)
-    finalQt <- mkFinalQType contentQt regular
-    selfQt  <- instantiateMembers lifted >>=
+    finalQt <- mkFinalQType contentQt $ removeBool regular
+    selfQt  <- instantiateMembers (removeBool lifted) >>=
                subCTVars contentQt finalQt . trec
     return (finalQt, selfQt)
   where
     removeBool = map (second fst)
 
+    -- Here we check that a collection can only have record content
     mkFinalQType conQt regularMem =
       case tag conQt of
         QTCon (QTRecord ids) ->

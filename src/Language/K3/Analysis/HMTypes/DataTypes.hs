@@ -244,6 +244,18 @@ isQTCollection (Node QTOpen [t, _])                   = isQTCollection t
 isQTCollection _ = False
 
 getQTRecordIds :: K3 QType -> Maybe [Identifier]
+getQTRecordIds (tag -> QTConst (QTRecord ids)) = Just ids
+getQTRecordIds (Node QTOpen [QTBottom, t])     = getQTRecordIds t
+-- We get lower bound if it's available
+getQTRecordIds (Node QTOpen [t, _])            = getQTRecordIds t
+getQTRecordIds _ = Nothing
+
+getQTCollectionIds :: K3 QType -> Maybe [Identifier]
+getQTCollectionIds (tag -> QTConst (QTCollection ids)) = Just ids
+-- We prefer lower bound to upper bound
+getQTCollectionIds (Node QTOpen [QTBottom, t])         = getQTCollectionIds t
+getQTCollectionIds (Node QTOpen [t, _])                = getQTCollectionIds t
+getQTCollectionIds _ = Nothing
 
 getQTUID :: Annotation QType -> UID
 getQTUID (QTUID uid) = uid
