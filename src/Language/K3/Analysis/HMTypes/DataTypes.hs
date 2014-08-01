@@ -28,7 +28,7 @@ data QType
         -- 1. lower bound (lowest supertype that must be supported)
         -- 2. upper bound (highest subtype that must be supported)
         -- Any missing bounds are replaced with QTBottom
-        | QTLower (Maybe QType) (Maybe QType)
+        | QTOpen
         | QTPrimitive QTBase
         | QTConst     QTData
         | QTVar       QTVarId
@@ -150,17 +150,8 @@ trec idt =
   let (ids, ts) = unzip idt in
   Node (QTRecord ids) ts
 
-tlowerrec :: [(Identifier, K3 QType)] -> K3 QType
-tlowerrec idt =
-  case trec idt of
-    Node (QTRecord x) ch -> Node (QTLower (QTRecord x)) ch
-    _ -> error "unexpected"
-
-thigherrec :: [(Identifier, K3 QType)] -> K3 QType
-thigherrec idt =
-  case trec idt of
-    Node (QTRecord x) ch -> Node (QTHigher (QTRecord x)) ch
-    _ -> error "unexpected"
+topen :: K3 QType -> K3 QType -> K3 Qtype
+topen low high = Node QTOpen [low, high]
 
 tcol :: K3 QType -> [Identifier] -> K3 QType
 tcol ct annIds = tdata (QTCollection annIds) [ct]
@@ -198,12 +189,6 @@ taddr = tprim QTAddress
 tnum :: K3 QType
 tnum = tprim QTNumber
 
-tlowernum :: K3 QType
-tlowernum = QTLower $ tprim QTNumber
-
-thighernum :: K3 QType
-thighernum = QTHigher $ tprim QTNumber
-
 tunit :: K3 QType
 tunit = ttup []
 
@@ -221,40 +206,44 @@ isQTNumeric :: K3 QType -> Bool
 isQTNumeric (tag -> QTPrimitive QTInt)    = True
 isQTNumeric (tag -> QTPrimitive QTReal)   = True
 isQTNumeric (tag -> QTPrimitive QTNumber) = True
-isQTNumeric (tag -> QTLower t _)  = isQTNumeric t
+isQTNumeric (Node QTOpen [QTBottom, t])   = isQTNumeric t
+isQTNumeric (Node QTOpen [t,_])           = isQTNumeric t
 isQTNumeric _ = False
 
 getQTNumeric (tag -> QTPrimitive QTInt)    = Just QTInt
 getQTNumeric (tag -> QTPrimitive QTReal)   = Just QTReal
 getQTNumeric (tag -> QTPrimitive QTNumber) = Just QTNumber
-getQTNumeric (tag -> QTLower t) = getQTNumeric t
+getQTNumeric (Node QTOpen [QTBottom, t])  = getQTNumeric t
 getQTNumeric _ = Nothing
 
 isQTVar :: K3 QType -> Bool
 isQTVar (tag -> QTVar _) = True
 isQTVar _ = False
 
-isQTLower:: K3 QType -> Bool
-isQTLower (tag -> QTLower _) = True
-isQTLower _ = False
-
-isQTHigher:: K3 QType -> Bool
-isQTHigher (tag -> QTHigher _) = True
-isQTHigher _ = False
+isQTOpen:: K3 QType -> Bool
+isQTOpen (tag -> QTOpen) = True
+isQTOpen _ = False
 
 isQTClosed :: K3 QType -> Bool
-isQTClosed (tag -> QTLower _) = False
-isQTClosed (tag -> QTHigher _) = False
-isQTClosed _ = True
+isQTClosed = not . isQTOpen
+
+isQTBottom :: K3 QType -> Bool
+isQTBottom (Node QTBottom _) = True
+isQTBottom _ = False
 
 isQTRecord :: K3 QType -> Bool
-isQTRecord n = maybe False (const True) getQTRecordIds n
+isQTRecord (tag -> QTConst (QTRecord _))          = True
+isQTRecord (Node QTOpen [isQTBottom -> True, t])  = isQTRecord t
+isQTRecord (Node QTOpen [t, _])                   = isQTRecord t
+isQTRecord _ = False
+
+isQTCollection :: K3 QType -> Bool
+isQTCollection (tag -> QTConst (QTCollection _)) = True
+isQTCollection (Node QTOpen [isQTBottom -> True, t])  = isQTCollection t
+isQTCollection (Node QTOpen [t, _])                   = isQTCollection t
+isQTCollection _ = False
 
 getQTRecordIds :: K3 QType -> Maybe [Identifier]
-getQTRecordIds (tag -> QTConst (QTRecord ids)) = Just ids
-getQTRecordIds (tag -> QTLower t) = getQTRecordIds t
-getQTRecordIds (tag -> QTHigher t) = getQTRecordIds t
-getQTRecordIds _ = Nothing
 
 getQTUID :: Annotation QType -> UID
 getQTUID (QTUID uid) = uid

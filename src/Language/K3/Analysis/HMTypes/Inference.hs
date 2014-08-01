@@ -528,35 +528,23 @@ unifyDrv preF postF qt1 qt2 = do
         subtypeOf (QTPrimitive x) (QTPrimitive y) = qtEnumOfBase x <= qtEnumOfBase y
         subtypeOf x y = error $ "expected numbers but got ["++show x++"], ["++show y++"]"
 
-        closed (getQTNumeric -> x) (getQTNumeric -> y) =
-          unifyAnno x y >>=
-            return . foldl' (@+) $ qtBaseOfEnum $ minimum $ qtEnumOfBase [x, y]
-
         lower  (getQTNumeric -> x) (getQTNumeric -> y) =
-          unifyAnno x y >>=
-            return . foldl' (@+) $ qtBaseOfEnum $ minimum $ qtEnumOfBase [x, y]
-
+          unifyAnno x y >>= return . foldl' (@+) $
+            QTPrimitive $ qtBaseOfEnum $ minimum $ qtEnumOfBase [x, y]
+        closed (getQTNumeric -> x) (getQTNumeric -> y) = lower
         upper  (getQTNumeric -> x) (getQTNumeric -> y) =
-          qtBaseOfEnum $ maximum $ qtEnumOfBase [x, y]
+          unifyAnno x y >>= return . foldl' (@+) $
+            QTPrimitive $ qtBaseOfEnum $ maximum $ qtEnumOfBase [x, y]
 
-
-
-      | p1 == p2  = return x
-      | otherwise =
-          -- Find lowest common primitive type, and add combined annotations
-          let base = qtBaseOfEnum $ minimum $ map qtEnumOfBase [p1, p2]
-          in unifyAnno x y >>=
-            return . foldl' (@+) $ recreateOpen p1 p2 base
-
-    -- other primitives have to match
+    -- other primitives don't subtype
     unifyDrv' t1@(tag -> QTPrimitive p1) (tag -> QTPrimitive p2)
       | p1 == p2  = return t1
       | otherwise = primitiveErr p1 p2 (annotations t1 ++ annotations t2)
 
     -- | Self type unification
     --   TODO: Fix self type so we know which self is referred to
-    unifyDrv' t1@(tag -> QTCon (QTCollection _)) (tag -> QTSelf) = return t1
-    unifyDrv' (tag -> QTSelf) t2@(tag -> QTCon (QTCollection _)) = return t2
+    unifyDrv' t1@(isQTCollection -> True) (tag -> QTSelf) = return t1
+    unifyDrv' (tag -> QTSelf) t2@(isQTCollection -> True) = return t2
 
     -- | Record combinations
     unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
@@ -570,9 +558,9 @@ unifyDrv preF postF qt1 qt2 = do
         -- should never happen
         subtypeOf x y = error $ "expected records but got ["++show x++"], ["++show y++"]"
 
-        closed = combineRecords $ frec . const
-        lower  = combineRecords $ flowerrec . (++)
-        upper  = combineRecords $ fhigherrec . const
+        closed = combineRecords $ trec . const
+        lower  = combineRecords $ trec . (++)
+        upper  = combineRecords $ trec . const
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
@@ -586,10 +574,22 @@ unifyDrv preF postF qt1 qt2 = do
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t2 t1
           _ -> unifyErr t1 t2 "collection-record" ""
 
-    -- TODO: support non-subtype ie. widening
-    -- TODO: Also support any order of annotations
-    -- Collection types cannot be widened ie. we don't have a way of merging 2 collections
-    -- if they don't match up in subtyping.
+    -- | Collection combinations
+    unifyDrv' t1@(isQTCollection -> True) t2@(isQTCollection -> True)
+      -- Check for correct subtyping
+      if checkSubtypes subtypeOf t1 t2 then
+        combineSubtypes closed lower upper t1 t2
+      else unifyErr t1 t2 "collection-subtyping"
+      where
+        -- subtype function for record-record
+        subtypeOf (QTConst(QTCollection ids)) (QTConst(QTCollection ids')) = ids' `subsetOf` ids
+        -- should never happen
+        subtypeOf x y = error $ "expected collections but got ["++show x++"], ["++show y++"]"
+
+        closed = combineCollections $ const
+        lower  = combineCollections $ nub . (++)
+        upper  = combineCollections $ intersection
+
     unifyDrv' t1@(tag -> QTConst (QTCollection idsA)) t2@(tag -> QTConst (QTCollection idsB))
         | idsA `subsetOf` idsB = onCollectionPair idsB t1 t2
         | idsB `subsetOf` idsA = onCollectionPair idsA t1 t2
@@ -625,42 +625,45 @@ unifyDrv preF postF qt1 qt2 = do
       case (x, y) of
         -- Lower and higher combinations should only occur once our lower and higher types
         -- are fully formed. Therefore, we can check for bad subtyping there too
-        (QTLower l l', QTLower r r') -> r' `subMaybe` l && l' `subMaybe` r
+        (Node QTOpen [l, l'], Node QTOpen [r, r']) -> r' `subMaybe` l && l' `subMaybe` r
         -- Cases with regular types are always checked for subtyping constraints
-        (QTLower l l', r)            -> r `subMaybe` l  && l' `subMaybe` r
-        (l, QTLower r r')            -> l `subMaybe` r  && r' `subMaybe` l
-        (l, r)                       -> l == r
+        (Node QTLower [l,l'], r)                   -> r `subMaybe` l  && l' `subMaybe` r
+        (l, Node QTLower [r, r'])                  -> l `subMaybe` r  && r' `subMaybe` l
+        (l, r)                                     -> l == r
       where
-        _       `subMaybe` Nothing = True
-        Nothing `subMaybe` _       = True
-        Just x  `subMaybe` Just y  = x `subF` y
+        _        `subMaybe` QTBottom = True
+        QTBottom `subMaybe` _        = True
+        x        `subMaybe` y        = x `subF` y
 
     -- General function to combine subtypes
     -- closedF, lowerF, upperF: functions to combine closed types (or closed + lower/upper),
     -- lower types, and upper types, respectively
     combineSubtypes closedF lowerF upperF x y =
       case (x, y) of
-        (QTLower l l', QTLower r r') -> do
+        (Node QTLower [l,l'], Node QTLower [r,r']) -> do
         -- Cases with only open types: we extend both the lower and upper limits,
         -- if they exist
           v  <- doMaybe lowerF l r
           v' <- doMaybe upperF l' r'
-          return $ QTLower v v'
+          return $ QTOpen v v'
         -- Cases with closed types: unify with both higher and lower
         -- Return whichever one isn't nothing
-        (QTLower l l', r) -> closedWithOpen r l l'
-        (l, QTLower r r') -> closedWithOpen l r r'
-        (l, r)            -> closedF l r
+        (Node QTOpen [l,l'], r)  -> closedWithOpen r l l'
+        (l, Node QTOpen [r,r'])  -> closedWithOpen l r r'
+        (l, r)                   -> closedF l r
       where
-        doMaybe _ (Just x) Nothing  = return Nothing
-        doMaybe _ Nothing (Just y)  = return Nothing
-        doMaybe f (Just x) (Just y) = f x y
+        doMaybe _ x (Node QTBottom) = x
+        doMaybe _ (Node QTBottom) y = y
+        doMaybe f x y               = f x y
 
+        -- Return a closed type
         closedWithOpen l r r' = do
           v' <- doMaybe closedF l r' -- unify with higher first
           v  <- doMaybe closedF l r
           -- If both unify, doesn't matter which one we return
-          return $ maybe (maybe Nothing id v) id v'
+          -- but we prefer the lower unification
+          return $ if isQTBottom v' then v
+                   else v'
 
     -- recurse on the pair of content of each collection
     -- Annotations are taken care of by caller
@@ -702,6 +705,14 @@ unifyDrv preF postF qt1 qt2 = do
     combineRecords f l r = do
       (common, diff) <- onOpenRecord l r
       unifyAnno l r >>= return . foldl' (@+) $ f common diff
+
+    -- Different ways to combine collections, based on given function
+    combineCollections f l@(tag -> Const(Collection ids))
+                         r@(tag -> Const(Collection ids')) = do
+      let newIds = f ids ids'
+      ch' <- rcr (head $ children l) (head $ children r)
+      unifyAnno l r >>=
+        return . foldl' (@+) $ tcol ch' newIds
 
     -- TODO: widen the original varids
 
