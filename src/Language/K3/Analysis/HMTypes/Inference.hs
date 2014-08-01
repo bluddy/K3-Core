@@ -383,62 +383,37 @@ newtv muid mspan = do
 -- NOTE: deep substitution breaks links between types
 --       Make sure not to break links for lowers or highers
 --       We should not do it until the VERY end
--- vidl: list of vids to substitute. If not given, all vids are substituted
 
 tvsub ::  K3 QType -> TInfM (K3 QType)
-tvsub qt = mapTree (sub IntSet.fromList vidl) qt
+tvsub qt = modifyTree sub qt
   where
-    sub vids _ t@(tag -> QTVar v) = do
+    sub t@(tag -> QTVar id') = do
       tvbe <- getTVBE
-      case tvblkup tvbe v of
+      case tvblkup tvbe id' of
         Just t' -> tvsub t' >>= extendAnns t
         _       -> return t
 
-    sub _ _ t = return t
+    sub t = return t
 
     -- Add to tdest all the annotations of tsrc
     extendAnns tsrc tdest = return $ foldl' (@+) tdest $
                               annotations tdest `difference` annotations tsrc
 
--- | Lower bound computation for numeric and record types.
---   Called by unify on nums and records
---   Really, this is just an expansion to the widest (lowest) type possible, with no
---   connection to super or subtype
---   It's not recursive. Unify does the recursive part
-tvlower :: K3 QType -> K3 QType -> TInfM (K3 QType)
-tvlower t1 t2 = getTVBE >>= \tvbe -> loop t1 t2
+-- | Replace one type with another throughout a tree
+tvreplace :: IntMap QType -> K3 QType -> K3 QType
+tvreplace dict qt = modifyTree sub qt
   where
+    -- qtvars have no children
+    sub t@(tag -> QTVar id') = do
+      case IntMap.lookup id' dict of
+        Just t' -> return $ extendAnns t t'
+        _       -> return t
 
-     -- TODO: collections: do we need open/closed collection types?
-      (QTCon (QTCollection _), QTCon (QTRecord _)) -> coveringCollection a' b'
-      (QTCon (QTRecord _), QTCon (QTCollection _)) -> coveringCollection b' a'
+    sub t = return t
 
-      (QTCon (QTCollection idsA), QTCon (QTCollection idsB))
-        | idsA `subsetOf` idsB -> mergedCollection idsB a' b'
-        | idsB `subsetOf` idsA -> mergedCollection idsA a' b'
-
-    mergedCollection annIds ct1 ct2 = do
-       -- run tvlower on the record of the element type
-       ctntLower <- tvlower (head $ children ct1) (head $ children ct2)
-       annLower ct1 ct2 >>=
-         return . foldl' (@+) (tcol ctntLower annIds)
-
-    -- Merge collection and record that fits it
-    -- NOTE: this shouldn't be necessary. We can type as if collections
-    -- can contain anything, and then just remove the ones that don't have
-    -- records
-    coveringCollection ct rt@(tag -> QTCon (QTRecord _)) =
-      collectionSubRecord ct rt >>= \case
-        Just _ -> return ct
-        _      -> lowerError ct rt
-
-    coveringCollection x y = lowerError x y
-
-    -- Join annotations together for lower, except for mutability contradiction
-    annLower x@(annotations -> annA) y@(annotations -> annB) =
-      let annAB   = nub $ annA ++ annB
-          invalid = [QTMutable, QTImmutable]
-      in if invalid `subsetOf` annAB then lowerError x y else return annAB
+    -- Add to tdest all the annotations of tsrc
+    extendAnns tsrc tdest = foldl' (@+) tdest $
+                              annotations tdest `difference` annotations tsrc
 
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
@@ -508,6 +483,7 @@ type UnifyPostF a = (a, a) -> K3 QType -> TInfM (K3 QType)
 -- | A unification driver, i.e., common unification code for both
 --   our standard unification method, and unification with variable overrides
 --   For 2 lower bound types, we find the lowest
+--   TODO: widen typevars
 unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> K3 QType -> K3 QType -> TInfM (K3 QType)
 unifyDrv preF postF qt1 qt2 = do
     (p1, qt1') <- preF qt1
@@ -546,7 +522,7 @@ unifyDrv preF postF qt1 qt2 = do
     unifyDrv' t1@(isQTCollection -> True) (tag -> QTSelf) = return t1
     unifyDrv' (tag -> QTSelf) t2@(isQTCollection -> True) = return t2
 
-    -- | Record combinations
+    -- | Record combinations with subtyping
     unifyDrv' t1@(isQTRecord -> True) t2@(isQTRecord -> True)
       -- Check for correct subtyping
       if checkSubtypes subtypeOf t1 t2 then
@@ -564,6 +540,8 @@ unifyDrv preF postF qt1 qt2 = do
 
     -- | Collection-as-record subtyping for projection
     --   Check that a record adequately unifies with a collection
+    --   NOTE: Hacky. We don't really check for a unification. We only
+    --         match on the ids
     unifyDrv' t1@(tag -> QTConst (QTCollection _)) t2@(isQTRecord -> True)
       = collectionSubRecord t1 t2 >>= \case
           Just (selfRecord, liftedAttrIds) -> onCollection selfRecord liftedAttrIds t1 t2
@@ -590,11 +568,7 @@ unifyDrv preF postF qt1 qt2 = do
         lower  = combineCollections $ nub . (++)
         upper  = combineCollections $ intersection
 
-    unifyDrv' t1@(tag -> QTConst (QTCollection idsA)) t2@(tag -> QTConst (QTCollection idsB))
-        | idsA `subsetOf` idsB = onCollectionPair idsB t1 t2
-        | idsB `subsetOf` idsA = onCollectionPair idsA t1 t2
-        | otherwise            = unifyErr t1 t2 "collection-collection"
-
+    -- | Other constructors must match completely
     unifyDrv' t1@(tag -> QTConst d1) t2@(tag -> QTConst d2) =
       onChildren d1 d2 "datatypes" (children t1) (children t2) (tdata d1)
 
@@ -788,45 +762,29 @@ unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
 
 
 -- | Given a polytype, for every polymorphic type var, replace all of
---   its occurrences in t with a fresh type variable. We do this by
---   creating a substitution tve and using tvsub on this near-empty env,
---   which replaces only these specific vars.
---   The new types will unify with our application site.
---   NOTE: I don't like how this is built. It depends on a certain state (tvbe)
+--   its occurrences in t with a fresh type variable.
 instantiate :: QPType -> TInfM (K3 QType)
 instantiate (QPType tvs t) =
   if null tvs then return t
   else do
-    withFreshTVBE $ do
-    -- This tvsub will only replace the given type variables
-    -- So it's ok. It's not destroying links.
-    Node (tg :@: anns) ch <- tvsub t
-    return t
- where
-   -- Generate fresh vars, run the action with the new, and restore the old
-   withFreshTVBE m = do
-    newtvbe <- associateWithFreshvars tvs
-    oldtvbe <- getTVBE
-    wrapWithTVBE newtvbe oldtvbe m
-
-   -- Run an action with a before- and after- var environment
-   wrapWithTVBE tvbeBefore tvbeAfter m = do
-    modify (modTvarBindEnv $ const tvbeBefore)
-    r <- m
-    modify (modTvarBindEnv $ const tvbeAfter)
-    return r
+    vids <- getFreshVarsFor tvs
+    let vidMap = IntMap.fromList $ zip (map getId vids) tvs
+    return $ tvreplace vidMap t
+  where
+    getId (QTVarId id) = id
+    getId x            = error $ "expected QTVarId but got " ++ show x
 
    -- Add fresh varIds for all existing tvars
    -- This was broken on the old implementation, which would give low vids
    -- to the instantiated types.
-   associateWithFreshvars tvs = foldlM addFreshVar (return tvbenv0) tvs
+   getFreshVarsFor tvs = mapM addFreshVar tvs
      where
-       addFreshVar acc tv = do
+       addFreshVar tv = do
          -- Copy over uid and span
          tve <- getTVE
          let (muid, mspan) = tvlkup tve tv
          tvfresh <- newtv muid mspan
-         return $ tvbext acc tv tvfresh
+         return tvfresh
 
 -- | Return a monomorphic polytype.
 monomorphize :: (Monad m) => K3 QType -> m QPType
