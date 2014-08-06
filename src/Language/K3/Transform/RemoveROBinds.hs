@@ -98,7 +98,7 @@ transformExpr e = evalState computation 1
     sendProjection acc (tag -> ELambda nm) = return $ Map.delete nm acc
     sendProjection acc _ = return acc
 
-    removeFromMap ids acc ch =
+    removeFromMap ids acc _ =
       let m = foldr Map.delete acc ids in
       return (m, m)
 
@@ -112,7 +112,7 @@ transformExpr e = evalState computation 1
     ch1SendProjection acc _ (details -> (EBindAs (BIndirection nm), ch, _)) = removeFromMap [nm] acc ch
     ch1SendProjection acc _ (details -> (EBindAs (BTuple ids), ch, _)) = removeFromMap ids acc ch
 
-    ch1SendProjection acc _ (details -> (EBindAs (BRecord idNames), chs, annos)) | isJust (annos @~ isROBAnno) = do
+    ch1SendProjection acc _ (details -> (EBindAs (BRecord idNames), _, annos)) | isJust (annos @~ isROBAnno) = do
       num <- get
       put $ num + 1
       let roIds = getROBval $ annos @~ isROBAnno
@@ -124,7 +124,7 @@ transformExpr e = evalState computation 1
           acc'     = (acc `Map.difference` bindIds) `Map.union` roIds'
       return (acc', acc') -- send to all the other children
 
-    ch1SendProjection acc _ (Node _ ch) = return (acc, acc)
+    ch1SendProjection acc _ (Node _ _) = return (acc, acc)
 
     -- Tranform variable accesses -> projections
     handleNode :: Monad m => BindMap -> [K3 Expression] -> K3 Expression -> m (K3 Expression)

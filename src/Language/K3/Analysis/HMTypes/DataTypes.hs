@@ -6,9 +6,9 @@
 --   We use a separate tree data type to ensure no mixing of type systems.
 module Language.K3.Analysis.HMTypes.DataTypes where
 
-import Data.List
 import Data.Tree
-import Data.Set
+import qualified Data.HashSet as HashSet
+import Data.IntSet(IntSet)
 
 import Language.K3.Core.Annotation
 import Language.K3.Core.Common
@@ -19,7 +19,7 @@ type QTVarId = Int
 -- Polymorphic type
 -- 1. All polymorphic vars in the type
 -- 2. Type
-data QPType = QPType [QTVarId] (K3 QType)
+data QPType = QPType IntSet (K3 QType)
                 deriving (Eq, Read, Show)
 
 data QType
@@ -61,7 +61,7 @@ qtEnumOfBase QTString  = 4
 qtEnumOfBase QTAddress = 5
 qtEnumOfBase QTNumber  = 6
 
-qtBaseOfEnum :: QTBase -> Int
+qtBaseOfEnum :: Int -> QTBase
 qtBaseOfEnum 0 = QTBool
 qtBaseOfEnum 1 = QTByte
 qtBaseOfEnum 2 = QTReal
@@ -69,6 +69,7 @@ qtBaseOfEnum 3 = QTInt
 qtBaseOfEnum 4 = QTString
 qtBaseOfEnum 5 = QTAddress
 qtBaseOfEnum 6 = QTNumber
+qtBaseOfEnum x = error $ show x ++ " is not a valid enum"
 
 data QTData
         = QTFunction
@@ -107,8 +108,11 @@ data instance Annotation QType
 tleaf :: QType -> K3 QType
 tleaf t = Node (t :@: []) []
 
+tnode :: QType -> [K3 QType] -> K3 QType
+tnode d = Node (d :@: [])
+
 tdata :: QTData -> [K3 QType] -> K3 QType
-tdata d c = Node (QTConst d :@: []) c
+tdata d = Node (QTConst d :@: [])
 
 tprim :: QTBase -> K3 QType
 tprim b = tleaf $ QTPrimitive b
@@ -143,15 +147,21 @@ tind :: K3 QType -> K3 QType
 tind c = tdata QTIndirection [c]
 
 ttup :: [K3 QType] -> K3 QType
-ttup c = tdata QTTuple c
+ttup = tdata QTTuple
 
 trec :: [(Identifier, K3 QType)] -> K3 QType
 trec idt =
   let (ids, ts) = unzip idt in
-  Node (QTRecord ids) ts
+  tdata (QTRecord ids) ts
 
-topen :: K3 QType -> K3 QType -> K3 Qtype
-topen low high = Node QTOpen [low, high]
+topen :: K3 QType -> K3 QType -> K3 QType
+topen low high = tnode QTOpen [low, high]
+
+tlower :: K3 QType -> K3 QType
+tlower t = topen t tbot
+
+thigher :: K3 QType -> K3 QType
+thigher = topen tbot
 
 tcol :: K3 QType -> [Identifier] -> K3 QType
 tcol ct annIds = tdata (QTCollection annIds) [ct]
@@ -203,17 +213,19 @@ isQTUID (QTUID _) = True
 isQTUID _ = False
 
 isQTNumeric :: K3 QType -> Bool
-isQTNumeric (tag -> QTPrimitive QTInt)    = True
-isQTNumeric (tag -> QTPrimitive QTReal)   = True
-isQTNumeric (tag -> QTPrimitive QTNumber) = True
-isQTNumeric (Node QTOpen [QTBottom, t])   = isQTNumeric t
-isQTNumeric (Node QTOpen [t,_])           = isQTNumeric t
+isQTNumeric (tag -> QTPrimitive QTInt)          = True
+isQTNumeric (tag -> QTPrimitive QTReal)         = True
+isQTNumeric (tag -> QTPrimitive QTNumber)       = True
+isQTNumeric (getQTOpenTypes -> [tag -> QTBottom, t])   = isQTNumeric t
+isQTNumeric (getQTOpenTypes -> [t,_])           = isQTNumeric t
 isQTNumeric _ = False
 
-getQTNumeric (tag -> QTPrimitive QTInt)    = Just QTInt
-getQTNumeric (tag -> QTPrimitive QTReal)   = Just QTReal
-getQTNumeric (tag -> QTPrimitive QTNumber) = Just QTNumber
-getQTNumeric (Node QTOpen [QTBottom, t])  = getQTNumeric t
+getQTNumeric :: K3 QType -> Maybe QTBase
+getQTNumeric (tag -> QTPrimitive QTInt)        = Just QTInt
+getQTNumeric (tag -> QTPrimitive QTReal)       = Just QTReal
+getQTNumeric (tag -> QTPrimitive QTNumber)     = Just QTNumber
+getQTNumeric (getQTOpenTypes -> [isQTBottom -> True, t]) = getQTNumeric t
+getQTNumeric (getQTOpenTypes -> [t, _])        = getQTNumeric t
 getQTNumeric _ = Nothing
 
 isQTVar :: K3 QType -> Bool
@@ -224,42 +236,46 @@ isQTOpen:: K3 QType -> Bool
 isQTOpen (tag -> QTOpen) = True
 isQTOpen _ = False
 
+getQTOpenTypes :: K3 QType -> [K3 QType]
+getQTOpenTypes (Node (QTOpen :@: _) ch) = ch
+getQTOpenTypes _ = []
+
 isQTClosed :: K3 QType -> Bool
 isQTClosed = not . isQTOpen
 
 isQTBottom :: K3 QType -> Bool
-isQTBottom (Node QTBottom _) = True
+isQTBottom (Node (QTBottom :@: _) _) = True
 isQTBottom _ = False
 
 isQTRecord :: K3 QType -> Bool
-isQTRecord (tag -> QTConst (QTRecord _))          = True
-isQTRecord (Node QTOpen [isQTBottom -> True, t])  = isQTRecord t
-isQTRecord (Node QTOpen [t, _])                   = isQTRecord t
+isQTRecord (tag -> QTConst (QTRecord _))                = True
+isQTRecord (getQTOpenTypes -> [isQTBottom -> True, t])  = isQTRecord t
+isQTRecord (getQTOpenTypes -> [t, _])                   = isQTRecord t
 isQTRecord _ = False
 
 isQTCollection :: K3 QType -> Bool
 isQTCollection (tag -> QTConst (QTCollection _)) = True
-isQTCollection (Node QTOpen [isQTBottom -> True, t])  = isQTCollection t
-isQTCollection (Node QTOpen [t, _])                   = isQTCollection t
+isQTCollection (getQTOpenTypes -> [isQTBottom -> True, t]) = isQTCollection t
+isQTCollection (getQTOpenTypes -> [t, _])                  = isQTCollection t
 isQTCollection _ = False
 
 getQTRecordIds :: K3 QType -> Maybe [Identifier]
 getQTRecordIds (tag -> QTConst (QTRecord ids)) = Just ids
-getQTRecordIds (Node QTOpen [QTBottom, t])     = getQTRecordIds t
+getQTRecordIds (getQTOpenTypes -> [isQTBottom -> True, t]) = getQTRecordIds t
 -- We get lower bound if it's available
-getQTRecordIds (Node QTOpen [t, _])            = getQTRecordIds t
+getQTRecordIds (getQTOpenTypes -> [t, _])                  = getQTRecordIds t
 getQTRecordIds _ = Nothing
 
 getQTCollectionIds :: K3 QType -> Maybe [Identifier]
 getQTCollectionIds (tag -> QTConst (QTCollection ids)) = Just ids
 -- We prefer lower bound to upper bound
-getQTCollectionIds (Node QTOpen [QTBottom, t])         = getQTCollectionIds t
-getQTCollectionIds (Node QTOpen [t, _])                = getQTCollectionIds t
+getQTCollectionIds (getQTOpenTypes -> [isQTBottom -> True, t]) = getQTCollectionIds t
+getQTCollectionIds (getQTOpenTypes -> [t, _])                  = getQTCollectionIds t
 getQTCollectionIds _ = Nothing
 
-getQTUID :: Annotation QType -> UID
-getQTUID (QTUID uid) = uid
-getQTUID _ = -1
+getQTUID :: Annotation QType -> Maybe UID
+getQTUID (QTUID uid) = Just uid
+getQTUID _           = Nothing
 
 instance Pretty QTVarId where
   prettyLines x = [show x]
@@ -274,4 +290,4 @@ instance Pretty (K3 QType) where
   prettyLines (Node (t :@: as) ts) = (show t ++ drawAnnotations as) : drawSubTrees ts
 
 instance Pretty QPType where
-  prettyLines (QPType tvars qt) = [unwords ["QPT", show tvars] ++ " "] %+ (prettyLines qt)
+  prettyLines (QPType tvars qt) = [unwords ["QPT", show tvars] ++ " "] %+ prettyLines qt
