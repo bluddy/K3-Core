@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 -- | Primitive Definitions for Compiler-Wide Terms.
 module Language.K3.Core.Common (
@@ -37,6 +38,7 @@ import Control.Concurrent.MVar
 import Data.Char
 import Data.Hashable ( Hashable(..) )
 import Data.IORef
+import GHC.Generics (Generic)
 
 import Text.ParserCombinators.ReadP    as TP
 import Text.ParserCombinators.ReadPrec as TRP
@@ -65,7 +67,9 @@ data Span
   deriving (Eq, Ord, Read, Show)
 
 -- | Unique identifiers for AST nodes.
-data UID = UID Int deriving (Eq, Ord, Read, Show)
+data UID = UID Int deriving (Eq, Ord, Read, Show, Generic)
+
+instance Hashable UID
 
 -- |Mutability modes for @CNone@.  These are kept distinct from the expression
 --  annotations because e.g. @mut (mut None mut, mut None mut)@ must have a

@@ -1,6 +1,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE ViewPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
 
 -- | Data types for Hindley-Milner inference.
 --   We use a separate tree data type to ensure no mixing of type systems.
@@ -9,6 +10,8 @@ module Language.K3.Analysis.HMTypes.DataTypes where
 import Data.Tree
 import qualified Data.HashSet as HashSet
 import Data.IntSet(IntSet)
+import GHC.Generics (Generic)
+import Data.Hashable(Hashable)
 
 import Language.K3.Core.Annotation
 import Language.K3.Core.Common
@@ -102,7 +105,9 @@ data instance Annotation QType
     = QTMutable
     | QTImmutable
     | QTUID UID
-  deriving (Eq, Read, Show)
+  deriving (Eq, Read, Show, Generic)
+
+instance Hashable (Annotation QType)
 
 -- | Type constructors
 tleaf :: QType -> K3 QType
