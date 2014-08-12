@@ -1041,17 +1041,20 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
         case b of
           BIndirection id' -> do
             itv <- newtv muid mspan
-            void $ unifyM ch1T (tind itv) $ bindErr "indirection"
+            void $ unifyWithOverrideM ch1T (tind itv) $ bindErr "indirection"
             monoBinding id' itv
 
           BTuple ids -> do
             idtvs <- mapM (const $ newtv muid mspan) ids
-            void $ unifyM ch1T (ttup idtvs) $ bindErr "tuple"
+            void $ unifyWithOverrideM ch1T (ttup idtvs) $ bindErr "tuple"
             mapM_ (uncurry monoBinding) $ zip ids idtvs
 
           BRecord ids -> do
-            idtvs <- mapM (const $ newtv muid mspan) ids
-            void $ unifyM ch1T (trec $ zip (map fst ids) idtvs) $ bindErr "record"
+            tvs <- mapM (const $ newtv muid mspan) ids
+            rtv <- newtv muid mspan
+            let r = trec $ zip (map fst ids) tvs
+            unifyv rtv (topen r tbot) 
+            void $ unifyWithOverrideM ch1T r $ bindErr "record"
             mapM_ (uncurry monoBinding) $ zip (map snd ids) idtvs
 
         return [iu]
@@ -1064,7 +1067,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       let muid  = n @~ isEUID  >>= getUID
           mspan = n @~ isESpan >>= getSpan
       itv  <- newtv muid mspan
-      void $  unifyM ch1T (topt itv) ("Invalid case-of source expression: "++)
+      void $  unifyWithOverrideM ch1T (topt itv) ("Invalid case-of source expression: "++)
       return [monoBinding i itv, modify $ \env -> tidele env i]
 
     sidewaysBinding _ (children -> ch) = return (replicate (length ch - 1) iu)
@@ -1131,7 +1134,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       case ipt of
         QPType s iqt -- monomorphic
           | s == IntSet.empty && iqt @~ isQTQualified == Just QTMutable -> do
-              void $ unifyM (iqt @- QTMutable) eqt $
+              void $ unifyWithOverrideMM (iqt @- QTMutable) eqt $
                 mkErrorF n (("Invalid assignment to " ++ id' ++ ": ") ++)
               return $ rebuildE n ch .+ tunit
           | s == IntSet.empty -> mutabilityErr id'
@@ -1143,9 +1146,11 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
           mspan = n @~ isESpan >>= getSpan
       srcqt   <- qTypeOfM $ head ch
       fieldqt <- newtv muid mspan
+      rtv     <- newtv muid mspan
       let prjqt = (topen $ trec [(id', fieldqt)]) tbot
+      unifyv rtv prjqt
       void $ trace (prettyTaggedPair ("infer prj " ++ id') srcqt prjqt)
-           $ unifyM srcqt prjqt $ mkErrorF n
+           $ unifyWithOverrideM srcqt rtv $ mkErrorF n
              (unlines ["Invalid record projection:", pretty srcqt, "and", pretty prjqt] ++)
       return $ rebuildE n ch .+ fieldqt
 
@@ -1164,13 +1169,13 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       void $ trace (prettyTaggedTriple "infer app " n fnqt $ tfun argqt retqt) $
         -- TODO: Apply needs a special unification, since we don't want to widen records
         -- and we do want to preserve the subtype relation
-        unifyM fnqt (tfun argqt retqt) errf
+        unifyWithOverrideM fnqt (tfun argqt retqt) errf
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EOperate OSeq) = do
         lqt <- qTypeOfM $ head ch
         rqt <- qTypeOfM $ last ch
-        void $ unifyM tunit lqt $ mkErrorF n ("Invalid left sequence operand: " ++)
+        void $ unifyWithOverrideM tunit lqt $ mkErrorF n ("Invalid left sequence operand: " ++)
         return $ rebuildE n ch .+ rqt
 
     -- | Check trigger-address pair and unify trigger type and message argument.
@@ -1183,15 +1188,21 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     -- | Unify operand types based on the kind of operator.
     inferQType ch n@(tag -> EOperate op)
-    -- TODO: deal with lower and numeric
       | numeric op = do
-            (lqt, resultqt) <- unifyBinaryM (topen tnum tbot) (topen tnum tbot) ch n numericError
-            return $ rebuildE n ch .+ resultqt
+          -- create tvars so we can widen
+          let muid  = n @~ isEUID  >>= getUID
+              mspan = n @~ isESpan >>= getSpan
+          tvl <- newtv muid mspan
+          unifyv tvl $ topen tnum tbot
+          tvr <- newtv muid mspan
+          unifyv tvr $ topen tnum tbot
+          (lqt, resultqt) <- unifyBinaryM tvl tvr ch n numericError
+          return $ rebuildE n ch .+ resultqt
 
       | comparison op = do
           lqt <- qTypeOfM $ head ch
           rqt <- qTypeOfM $ last ch
-          void $ unifyM lqt rqt $ mkErrorF n comparisonError
+          void $ unifyWithOverrideM lqt rqt $ mkErrorF n comparisonError
           return $ rebuildE n ch .+ tbool
 
       | logic op = do
@@ -1213,14 +1224,14 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       | otherwise = left $ "Invalid operation: " ++ show op
 
     -- First child generation has already been performed in sidewaysBinding
-    -- Delete the parameter from the env as we leave this node
+    -- Delete the identifier from the env as we leave this node
     inferQType ch n@(tag -> ELetIn j) = do
       bqt <- qTypeOfM $ last ch
       void $ modify $ \env -> tidele env j
       return $ rebuildE n ch .+ bqt
 
     -- First child unification has already been performed in sidewaysBinding
-    -- Delete the parameters from the env as we leave this node
+    -- Delete the identifiers from the env as we leave this node
     inferQType ch n@(tag -> EBindAs b) = do
       bqt <- qTypeOfM $ last ch
       case b of
@@ -1241,15 +1252,16 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       pqt   <- qTypeOfM $ head ch
       tqt   <- qTypeOfM $ ch !! 1
       eqt   <- qTypeOfM $ last ch
-      void  $  unifyM pqt tbool $ mkErrorF n ("Invalid if-then-else predicate: " ++)
+      void $ unifyWithOverrideM pqt tbool $
+               mkErrorF n ("Invalid if-then-else predicate: " ++)
       retqt <- unifyWithOverrideM tqt eqt $ mkErrorF n ("Mismatched condition branches: " ++)
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EAddress) = do
       hostqt <- qTypeOfM $ head ch
       portqt <- qTypeOfM $ last ch
-      void $ unifyM hostqt tstr $ mkErrorF n ("Invalid address host string: " ++)
-      void $ unifyM portqt tint $ mkErrorF n ("Invalid address port int: " ++)
+      void $ unifyWithOverrideM hostqt tstr $ mkErrorF n ("Invalid address host string: " ++)
+      void $ unifyWithOverrideM portqt tint $ mkErrorF n ("Invalid address port int: " ++)
       return $ rebuildE n ch .+ taddr
 
     inferQType ch n  = return $ rebuildE n ch
@@ -1261,13 +1273,13 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
     unifyBinaryM lexpected rexpected ch n errf = do
       lqt <- qTypeOfM $ head ch
       rqt <- qTypeOfM $ last ch
-      void $ unifyM lexpected lqt (mkErrorF n $ errf "left")
-      void $ unifyM rexpected rqt (mkErrorF n $ errf "right")
+      void $ unifyWithOverrideM lexpected lqt (mkErrorF n $ errf "left")
+      void $ unifyWithOverrideM rexpected rqt (mkErrorF n $ errf "right")
       return (lqt, rqt)
 
     unifyUnaryM expected ch errf = do
         chqt <- qTypeOfM $ head ch
-        void $ unifyM chqt expected errf
+        void $ unifyWithOverrideM chqt expected errf
         return chqt
 
     numeric    op = op `elem` [OAdd, OSub, OMul, ODiv, OMod]
@@ -1556,7 +1568,7 @@ instance Pretty TVEnv where
   prettyLines (n, m) = ("# vars: " ++ show n) : prettyLines m
 
 instance Pretty (UID, Maybe Span) where
-  prettyLines (u, ms) = [show u ++ maybe "" show ms]
+  prettyLines (u, ms) = [show u ++ maybe "" (\x -> ", " ++ show x) ms]
 
 prettyPairList :: (Show a, Pretty b) => [(a,b)] -> [String]
 prettyPairList l = foldl' (\acc kvPair -> acc ++ prettyPair kvPair) [] l
