@@ -104,7 +104,6 @@ instance Eq QTData where
 data instance Annotation QType
     = QTMutable
     | QTImmutable
-    | QTUID UID
   deriving (Eq, Read, Show, Generic)
 
 instance Hashable (Annotation QType)
@@ -213,10 +212,6 @@ isQTQualified QTImmutable = True
 isQTQualified QTMutable   = True
 isQTQualified _ = False
 
-isQTUID :: Annotation QType -> Bool
-isQTUID (QTUID _) = True
-isQTUID _ = False
-
 isQTNumeric :: K3 QType -> Bool
 isQTNumeric (tag -> QTPrimitive QTInt)          = True
 isQTNumeric (tag -> QTPrimitive QTReal)         = True
@@ -236,6 +231,10 @@ getQTNumeric _ = Nothing
 isQTVar :: K3 QType -> Bool
 isQTVar (tag -> QTVar _) = True
 isQTVar _ = False
+
+getQTVarId :: K3 QType -> QTVarId
+getQTVarId (tag -> QTVar i) = i
+getQTVarId _                = error "expected qtvar"
 
 isQTOpen:: K3 QType -> Bool
 isQTOpen (tag -> QTOpen) = True
@@ -277,10 +276,6 @@ getQTCollectionIds (tag -> QTConst (QTCollection ids)) = Just ids
 getQTCollectionIds (getQTOpenTypes -> [isQTBottom -> True, t]) = getQTCollectionIds t
 getQTCollectionIds (getQTOpenTypes -> [t, _])                  = getQTCollectionIds t
 getQTCollectionIds _ = Nothing
-
-getQTUID :: Annotation QType -> Maybe UID
-getQTUID (QTUID uid) = Just uid
-getQTUID _           = Nothing
 
 instance Pretty QTVarId where
   prettyLines x = [show x]
