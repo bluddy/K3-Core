@@ -433,12 +433,12 @@ tvreplace dict tree = runIdentity $ modifyTree sub tree
 
 -- Unification helpers.
 -- | Returns a self record and lifted attribute identifiers when given
---   a collection and a record that is a hacky subtype of said collection.
+--   a collection and a record that is a hacky supertype of said collection.
 --   This is hacky because we only check that the records match the collection at the
 --   id level. Collections are records because you can project on them.
 collectionSubRecord :: K3 QType -> K3 QType -> TInfM (Maybe (K3 QType, [Identifier]))
 collectionSubRecord ct@(getQTCollectionIds -> Just annIds)
-                       (getQTRecordIds     -> Just ids)
+                       (getQTRecordIdsCh   -> Just (ids, _))
   = liftM testF (get >>= mkColQT)
   where
     mkColQT tienv = do
@@ -492,10 +492,10 @@ unifyv v t = do
       | otherwise       = return $ Node (tag n :@: anns) nch
 
     -- We're at Open. Check the case where the child was a record
-    inject _ [tag -> QTSelf] (Node (QTOpen :@: anns) [tag -> QTConst(QTRecord _), _])
+    inject _ [tag -> QTSelf, _] (Node (QTOpen :@: anns) [tag -> QTConst(QTRecord _), _])
       = retTSelf anns
 
-    inject _ [tag -> QTSelf] (Node (QTOpen :@: anns) [_, tag -> QTConst(QTRecord _)])
+    inject _ [_, tag -> QTSelf] (Node (QTOpen :@: anns) [_, tag -> QTConst(QTRecord _)])
       = retTSelf anns
 
     inject _ ch n = return $ Node (tag n :@: annotations n) ch
@@ -695,7 +695,7 @@ unifyDrv preF postF qt1 qt2 = do
     -- unify the record with the collection
     onCollection :: K3 QType -> [Identifier] -> K3 QType -> K3 QType -> TInfM (K3 QType)
     onCollection selfQt liftedAttrIds
-                 ct@(tag -> QTConst (QTCollection _)) rt@(getQTRecordIds -> Just ids)
+                 ct@(tag -> QTConst (QTCollection _)) (getQTRecordIdsCh -> Just (ids, ch))
       = do
           -- substitute col type into children of self record
           subChQt <- mapM (substituteSelfQt ct) $ children selfQt
@@ -704,19 +704,19 @@ unifyDrv preF postF qt1 qt2 = do
               tdcon       = QTRecord liftedAttrIds
               errk        = "collection subtype"
               colCtor   _ = ct
-          onChildren tdcon tdcon errk projSelfT (children rt) colCtor
+          onChildren tdcon tdcon errk projSelfT ch colCtor
 
     onCollection _ _ ct rt =
       left $ unlines ["Invalid collection arguments:", pretty ct, "and", pretty rt]
 
     -- Return the common ids and different ids after unifying the common ids
     -- This function should only really have direct record ids
-    onOpenRecord l@(getQTRecordIds -> Just ids) r@(getQTRecordIds -> Just ids') = do
-      let allIdCh = zip (ids ++ ids') $ children l ++ children r
+    onOpenRecord (getQTRecordIdsCh -> Just (ids, ch)) (getQTRecordIdsCh -> Just (ids', ch')) = do
+      let allIdCh = zip (ids ++ ids') $ ch ++ ch'
           commonIds = ids `intersection` ids'
           diffIds = ids `diff2way` ids'
-          commonlch = fromMaybe err $ shuffleNamedPairs commonIds $ zip ids  $ children l
-          commonrch = fromMaybe err $ shuffleNamedPairs commonIds $ zip ids' $ children r
+          commonlch = fromMaybe err $ shuffleNamedPairs commonIds $ zip ids  ch
+          commonrch = fromMaybe err $ shuffleNamedPairs commonIds $ zip ids' ch'
           diffCh = fromMaybe err $ shuffleNamedPairs diffIds allIdCh
           err = error "Malfunction in shuffleNamedPairs"
       -- Recurse on the common children, unifying them
@@ -738,7 +738,7 @@ unifyDrv preF postF qt1 qt2 = do
     onList a b ctor errf =
       if length a == length b
         then liftM ctor $ zipWithM rcr a b
-        else errf "Unification mismatch on lists."
+        else errf $ "Unification mismatch on lists:\nList 1:" ++ show a ++ "\nList 2:" ++ show b
 
     -- Substitute a collection type for self type inside a type
     substituteSelfQt :: K3 QType -> K3 QType -> TInfM (K3 QType)
@@ -924,6 +924,7 @@ inferProgramTypes prog = do
                         Maybe (K3 Expression) -> TInfM (Maybe (K3 Expression))
     unifyInitializer n qptE eOpt = do
       qpt <- case qptE of
+              -- Left is a global, Right is a trigger
               Left Nothing     -> get >>= \env -> liftEitherM (tilkupe env n)
               Left (Just qpt') -> modify (\env -> tiexte env n qpt') >> return qpt'
               Right qpt'       -> return qpt'

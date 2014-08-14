@@ -12,6 +12,7 @@ import qualified Data.HashSet as HashSet
 import Data.IntSet(IntSet)
 import GHC.Generics (Generic)
 import Data.Hashable(Hashable)
+import Control.Arrow ((&&&))
 
 import Language.K3.Core.Annotation
 import Language.K3.Core.Common
@@ -210,7 +211,6 @@ tunit = ttup []
 isQTQualified :: Annotation QType -> Bool
 isQTQualified QTImmutable = True
 isQTQualified QTMutable   = True
-isQTQualified _ = False
 
 isQTNumeric :: K3 QType -> Bool
 isQTNumeric (tag -> QTPrimitive QTInt)          = True
@@ -263,12 +263,12 @@ isQTCollection (getQTOpenTypes -> [isQTBottom -> True, t]) = isQTCollection t
 isQTCollection (getQTOpenTypes -> [t, _])                  = isQTCollection t
 isQTCollection _ = False
 
-getQTRecordIds :: K3 QType -> Maybe [Identifier]
-getQTRecordIds (tag -> QTConst (QTRecord ids)) = Just ids
-getQTRecordIds (getQTOpenTypes -> [isQTBottom -> True, t]) = getQTRecordIds t
+getQTRecordIdsCh :: K3 QType -> Maybe ([Identifier], [K3 QType])
+getQTRecordIdsCh (tag &&& children -> (QTConst (QTRecord ids), ch)) = Just (ids, ch)
+getQTRecordIdsCh (getQTOpenTypes   -> [isQTBottom -> True, t]) = getQTRecordIdsCh t
 -- We get lower bound if it's available
-getQTRecordIds (getQTOpenTypes -> [t, _])                  = getQTRecordIds t
-getQTRecordIds _ = Nothing
+getQTRecordIdsCh (getQTOpenTypes   -> [t, _])                  = getQTRecordIdsCh t
+getQTRecordIdsCh _ = Nothing
 
 getQTCollectionIds :: K3 QType -> Maybe [Identifier]
 getQTCollectionIds (tag -> QTConst (QTCollection ids)) = Just ids
