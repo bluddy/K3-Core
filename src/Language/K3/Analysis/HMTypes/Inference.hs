@@ -324,15 +324,17 @@ tvfree venv benv = filter (not . flip IntMap.member benv) [0..fst venv-1]
 
 -- `Shallow' substitution
 -- Find a type that's not a variable, or is a free typevar
-tvchase :: TVBEnv -> K3 QType -> K3 QType
-tvchase tbe (tag -> QTVar v) | Just t <- tvblkup tbe v = tvchase tbe t
-tvchase _ t = t
+tvchase :: TVBEnv -> TVEnv -> K3 QType -> K3 QType
+tvchase tvbe tve (tag -> QTVar v) | Just t <- tvblkup tvbe v = tvchase tvbe tve t
+tvchase _ tve t = tvAddUIDSpan tve t
 
 -- 'Shallow' substitution, additionally returning the last variable in
 --  the chased chain.
-tvchasev :: TVBEnv -> Maybe QTVarId -> K3 QType -> (Maybe QTVarId, K3 QType)
-tvchasev tbe _ (tag -> QTVar v) | Just ctv <- tvblkup tbe v = tvchasev tbe (Just v) ctv
-tvchasev _ lastV tv = (lastV, tv)
+tvchasev :: TVBEnv -> TVEnv -> K3 QType -> (Maybe QTVarId, K3 QType)
+tvchasev tvbe tve t = loop Nothing t
+  where
+    loop _ (tag -> QTVar v) | Just ctv <- tvblkup tvbe v = loop (Just v) ctv
+    loop lastV tv = (lastV, tvAddUIDSpan tve tv)
 
 -- Compute (quite unoptimally) the characteristic function of the set
 --  forall tvb \in fv(tve_before). Union fv(tvsub(tve_after,tvb))
@@ -392,12 +394,12 @@ newtv muid mspan = do
   ienv <- get
   let (nv, ienv') = addVar ienv
   put ienv'
-  return $ tvar nv
+  return $ tvAddUIDSpan (tvarEnv ienv') $ tvar nv
   where
     addVar ienv =
       let env = tvarEnv ienv
           (nv, env') = tvinc env
-          env'' = maybe env' (\muid' -> tvext env' nv muid' mspan) muid
+          env'' = maybe env' (\uid -> tvext env' nv uid mspan) muid
       in (nv, ienv {tvarEnv=env''})
 
 -- Deep substitute, throughout type structure
@@ -471,12 +473,13 @@ unifyv v1 t@(tag -> QTVar v2)
 
 unifyv v t = do
   tvbe <- getTVBE
+  tve  <- getTVE
   if occurs v t tvbe
     then do
       -- Recursive unification. Can only be for self
       -- Inject self into every record type in the type
       -- TODO: Check: is this ever activated?
-      qt <- injectSelfQt tvbe t
+      qt <- injectSelfQt tvbe tve t
       addToEnv "unifyv yes occurs" qt
     else
       -- just point the variable to the type
@@ -484,21 +487,21 @@ unifyv v t = do
 
   where
     -- Replace all records that contain v with self
-    injectSelfQt tvbe t' = mapTree (inject tvbe) t'
+    injectSelfQt tvbe tve t' = mapTree (inject tvbe tve) t'
 
     -- Map goes up, so we need to handle both record and open record separately
-    inject tvbe nch n@((tag &&& annotations) . tvchase tvbe -> (QTConst(QTRecord _), anns))
+    inject tvbe tve nch n@((tag &&& annotations) . tvchase tvbe tve -> (QTConst(QTRecord _), anns))
       | occurs v n tvbe = retTSelf anns
       | otherwise       = return $ Node (tag n :@: anns) nch
 
     -- We're at Open. Check the case where the child was a record
-    inject _ [tag -> QTSelf, _] (Node (QTOpen :@: anns) [tag -> QTConst(QTRecord _), _])
+    inject _ _ [tag -> QTSelf, _] (Node (QTOpen :@: anns) [tag -> QTConst(QTRecord _), _])
       = retTSelf anns
 
-    inject _ [_, tag -> QTSelf] (Node (QTOpen :@: anns) [_, tag -> QTConst(QTRecord _)])
+    inject _ _ [_, tag -> QTSelf] (Node (QTOpen :@: anns) [_, tag -> QTConst(QTRecord _)])
       = retTSelf anns
 
-    inject _ ch n = return $ Node (tag n :@: annotations n) ch
+    inject _ _ ch n = return $ Node (tag n :@: annotations n) ch
 
     retTSelf anns = return $ foldl' (@+) tself anns
 
@@ -761,27 +764,48 @@ unifyDrv preF postF qt1 qt2 = do
     subSelfErr ct = left $ boxToString $
       "Invalid self substitution, qtype is not a collection: " : prettyLines ct
 
+tvAddUIDSpan :: TVEnv -> K3 QType -> K3 QType
+tvAddUIDSpan tve n@(tag -> QTVar i) =
+  case n @~ isQTUIDSpan of
+    Just _  -> n
+    Nothing -> 
+      let (muid, mspan) = tvlkup tve i
+          n'  = maybe n  (\u -> n  @+ QTUID u) muid
+          n'' = maybe n' (\s -> n' @+ QTSpan s) mspan
+      in n''
+
+tvAddUIDSpan _ n = n
+
+
 -- | Type unification.
 -- UnifyDrv with pre-tvchase
 unifyM :: K3 QType -> K3 QType -> (String -> String) -> TInfM ()
 unifyM t1 t2 errf = trace (prettyTaggedPair "unifyM" t1 t2) $
                       reasonM errf $ void $ unifyDrv preChase postId t1 t2
-  where preChase qt = getTVBE >>= \tvbe -> return ((), tvchase tvbe qt)
+  where preChase qt = do
+          tvbe <- getTVBE
+          tve  <- getTVE
+          return ((), tvchase tvbe tve qt)
         postId _    = return
 
 -- | Type unification with variable overrides to the unification result.
 -- TODO: is this necessary?
 -- I think it makes the chain shorter
 unifyWithOverrideM :: K3 QType -> K3 QType -> (String -> String) -> TInfM (K3 QType)
-unifyWithOverrideM qt1 qt2 errf = trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
-                                    reasonM errf $ unifyDrv preChase postUnify qt1 qt2
+unifyWithOverrideM qt1 qt2 errf = do
+    trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
+      reasonM errf $ unifyDrv preChase postUnify qt1 qt2
         -- as our first tuple member, return the last variable in the chain
-  where preChase qt = getTVBE >>= \tvbe -> return $ tvchasev tvbe Nothing qt
+  where preChase qt = do
+          tvbe <- getTVBE
+          tve  <- getTVE
+          return $ tvchasev tvbe tve qt
+
         -- take the 'last variables' emitted by unifyDrv
         postUnify (v1, v2) qt = do
           tvbe <- getTVBE
           let vs = catMaybes [v1, v2]
-          -- Check if occurs, if so, point last var at the unified type
+          -- Check if occurs, if not, point last var at the unified type
           void $ mapM_ (\v -> unless (occurs v qt tvbe) $ unifyv v qt) vs
           return $ if null vs then qt
                    else foldl' (@+) (tvar $ head vs) $ annotations qt
@@ -1479,7 +1503,8 @@ translateExprTypes expr = mapTree translate expr >>= \e -> return $ flip addTQua
       nanns <- mapM translateEQType $ filter (not . isEType) anns
       return (Node (tg :@: nanns) nch')
 
-    addTQualifier tqOpt e@(Node (tg :@: anns) ch) = maybe e (\tq -> Node (tg :@: map (inject tq) anns) ch) tqOpt
+    addTQualifier tqOpt e@(Node (tg :@: anns) ch) =
+      maybe e (\tq -> Node (tg :@: map (inject tq) anns) ch) tqOpt
       where inject tq (EType t) = maybe (EType $ t @+ tq) (const $ EType t) $ find isTQualified $ annotations t
             inject _ a = a
 
@@ -1497,6 +1522,7 @@ translateExprTypes expr = mapTree translate expr >>= \e -> return $ flip addTQua
     translateAnnotation a = case a of
       QTMutable   -> TMutable
       QTImmutable -> TImmutable
+      x -> error $ "Expected mutability annotation but got " ++ show x
 
 
 translateQType :: K3 QType -> Either String (K3 Type)
@@ -1514,6 +1540,7 @@ translateQType qt = mapTree translateWithMutability qt
         translateAnnotation a = case a of
           QTMutable   -> TMutable
           QTImmutable -> TImmutable
+          x -> error $ "Expected mutability annotation but got " ++ show x
 
         translate _ qt'
           | QTBottom     <- tag qt' = return TC.bottom

@@ -105,6 +105,8 @@ instance Eq QTData where
 data instance Annotation QType
     = QTMutable
     | QTImmutable
+    | QTUID UID
+    | QTSpan Span
   deriving (Eq, Read, Show, Generic)
 
 instance Hashable (Annotation QType)
@@ -211,6 +213,12 @@ tunit = ttup []
 isQTQualified :: Annotation QType -> Bool
 isQTQualified QTImmutable = True
 isQTQualified QTMutable   = True
+isQTQualified _ = False
+
+isQTUIDSpan :: Annotation QType -> Bool
+isQTUIDSpan (QTSpan _) = True
+isQTUIDSpan (QTUID  _) = True
+isQTUIDSpan _ = False
 
 isQTNumeric :: K3 QType -> Bool
 isQTNumeric (tag -> QTPrimitive QTInt)          = True
