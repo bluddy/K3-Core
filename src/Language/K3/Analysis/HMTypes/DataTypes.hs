@@ -26,11 +26,14 @@ type QTVarId = Int
 data QPType = QPType IntSet (K3 QType)
                 deriving (Eq, Read, Show)
 
+-- Open type refers to a type with subtyping that is being built by inference
+-- Closed type therefore still subtypes, but it's not being expanded by inference
+
 data QType
         = QTBottom
         -- QTOpen children:
-        -- 1. lower bound (lowest supertype that must be supported)
-        -- 2. upper bound (highest subtype that must be supported)
+        -- 1. lower bound (highest subtype of all constraints)
+        -- 2. upper bound (lowest supertype of all constraints)
         -- Any missing bounds are replaced with QTBottom
         | QTOpen
         | QTPrimitive QTBase
