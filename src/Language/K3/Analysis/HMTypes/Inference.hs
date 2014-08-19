@@ -519,8 +519,8 @@ type UnifyPostF a = (a, a) -> K3 QType -> TInfM (K3 QType)
 --   For 2 lower bound types, we find the lowest
 --   doOpen: whether we should get the widest type for open types or not
 --           (we don't do it for lambda application)
-unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> Bool -> K3 QType -> K3 QType -> TInfM (K3 QType)
-unifyDrv preF postF allowSub qt1 qt2 = do
+unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> Bool -> QTMutCheck -> K3 QType -> K3 QType -> TInfM (K3 QType)
+unifyDrv preF postF allowSub mutCheck qt1 qt2 = do
     (p1, qt1') <- preF qt1
     (p2, qt2') <- preF qt2
     qt         <- trace (prettyTaggedPair "unifyDrv" qt1' qt2') $
@@ -631,16 +631,19 @@ unifyDrv preF postF allowSub qt1 qt2 = do
       | otherwise    = unifyErr t1 t2 "qtypes" ""
 
     -- recurse unifyDrv
+    -- We always recurse with full mutability check
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
-    rcr a b = unifyDrv preF postF allowSub a b
+    rcr a b = unifyDrv preF postF allowSub MutEq a b
 
     -- Join annotations together except for mutability contradiction
     unifyAnno :: K3 QType -> K3 QType -> TInfM [Annotation QType]
-    unifyAnno x@(annotations -> annA) y@(annotations -> annB) = do
-      let annAB   = nub $ annA ++ annB
-          invalid = [QTMutable, QTImmutable]
-      if invalid `subsetOf` annAB then unifyErr x y "mutability-annotations" ""
-        else return annAB
+    unifyAnno sup@(annotations -> annA) sub@(annotations -> annB) =
+      let annAB = nub $ annA ++ annB in
+      case (sup @~ isQTQualified, sub @~ isQTQualified, mutCheck) of
+        (Just x, Just y, _) | x == y               -> return annAB
+        (Just QTImmutable, Just QTMutable, MutSub) -> return annAB
+        (_, _, MutNone)                            -> return annAB
+        _ -> unifyErr sup sub "mutability-annotations" ""
 
     -- Check if we meet subtyping criteria
     -- subF is the way we check one type is a subtype of the other
@@ -787,13 +790,19 @@ unifyM allowSub t1 t2 errf =
           return ((), tvchase tvbe tve qt)
         postId _    = return
 
+-- Mutability modifier for unification
+-- Only lasts one level deep, as any further is always a type error
+data QTMutCheck = MutNone    -- We don't care about mutability
+                | MutSub     -- We care and can subtype
+                | MutEq      -- We care and mutability must be equal
+
 -- | Type unification with variable overrides to the unification result.
 -- TODO: is this necessary?
 -- I think it makes the chain shorter
-unifyWithOverrideM :: Bool -> K3 QType -> K3 QType -> (String -> String) -> TInfM (K3 QType)
-unifyWithOverrideM allowSub qt1 qt2 errf = do
+unifyWithOverrideM :: Bool -> QTMutCheck -> K3 QType -> K3 QType -> (String -> String) -> TInfM (K3 QType)
+unifyWithOverrideM allowSub mutCheck qt1 qt2 errf = do
   trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
-    reasonM errf $ unifyDrv preChase postUnify allowSub qt1 qt2
+    reasonM errf $ unifyDrv preChase postUnify allowSub mutCheck qt1 qt2
         -- as our first tuple member, return the last variable in the chain
   where preChase qt = do
           tvbe <- getTVBE
@@ -956,7 +965,7 @@ inferProgramTypes prog = do
         Just e -> do
           qt1 <- instantiate qpt
           qt2 <- qTypeOfM e
-          void $ unifyWithOverrideM True qt1 qt2 $ mkErrorF e unifyInitErrF
+          void $ unifyWithOverrideM True MutEqual qt1 qt2 $ mkErrorF e unifyInitErrF
           liftM Just $ substituteDeepQt e
 
         Nothing -> return Nothing
@@ -1071,12 +1080,12 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
         case b of
           BIndirection id' -> do
             itv <- newtv muid mspan
-            void $ unifyWithOverrideM False ch1T (tind itv) $ bindErr "indirection"
+            void $ unifyWithOverrideM False MutSub ch1T (tind itv) $ bindErr "indirection"
             monoBinding id' itv
 
           BTuple ids -> do
             idtvs <- mapM (const $ newtv muid mspan) ids
-            void $ unifyWithOverrideM False ch1T (ttup idtvs) $ bindErr "tuple"
+            void $ unifyWithOverrideM False MutSub ch1T (ttup idtvs) $ bindErr "tuple"
             mapM_ (uncurry monoBinding) $ zip ids idtvs
 
           BRecord ids -> do
@@ -1084,7 +1093,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
             rtv <- newtv muid mspan
             let r = trec $ zip (map fst ids) tvs
             unifyv (getQTVarId rtv) (topen r tbot)
-            void $ unifyWithOverrideM True ch1T r $ bindErr "record"
+            void $ unifyWithOverrideM True MutSub ch1T r $ bindErr "record"
             mapM_ (uncurry monoBinding) $ zip (map snd ids) tvs
 
         return [iu]
@@ -1097,7 +1106,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       let muid  = n @~ isEUID  >>= getUID
           mspan = n @~ isESpan >>= getSpan
       itv  <- newtv muid mspan
-      void $  unifyWithOverrideM False ch1T (topt itv) ("Invalid case-of source expression: "++)
+      void $  unifyWithOverrideM False MutSub ch1T (topt itv) ("Invalid case-of source expression: "++)
       return [monoBinding i itv, modify $ \env -> tidele env i]
 
     sidewaysBinding _ (children -> ch) = return (replicate (length ch - 1) iu)
@@ -1164,7 +1173,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       case ipt of
         QPType s iqt -- monomorphic
           | s == IntSet.empty && iqt @~ isQTQualified == Just QTMutable -> do
-              void $ unifyWithOverrideM False (iqt @- QTMutable) eqt $
+              void $ unifyWithOverrideM False MutNone iqt eqt $
                 mkErrorF n (("Invalid assignment to " ++ id' ++ ": ") ++)
               return $ rebuildE n ch .+ tunit
           | s == IntSet.empty -> mutabilityErr id'
@@ -1180,7 +1189,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       let prjqt = topen (trec [(id', fieldqt)]) tbot
       unifyv (getQTVarId rtv) prjqt
       void $ trace (prettyTaggedPair ("infer prj " ++ id') srcqt prjqt)
-           $ unifyWithOverrideM True srcqt rtv $ mkErrorF n
+           $ unifyWithOverrideM True MutNone srcqt rtv $ mkErrorF n
              (unlines ["Invalid record projection:", pretty srcqt, "and", pretty prjqt] ++)
       return $ rebuildE n ch .+ fieldqt
 
@@ -1199,13 +1208,13 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       void $ trace (prettyTaggedTriple "infer app " n fnqt $ tfun argqt retqt) $
         -- TODO: Apply needs a special unification, since we don't want to widen records
         -- and we do want to preserve the subtype relation
-        unifyWithOverrideM True fnqt (tfun argqt retqt) errf
+        unifyWithOverrideM True MutSub fnqt (tfun argqt retqt) errf
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EOperate OSeq) = do
         lqt <- qTypeOfM $ head ch
         rqt <- qTypeOfM $ last ch
-        void $ unifyWithOverrideM False tunit lqt $ mkErrorF n ("Invalid left sequence operand: " ++)
+        void $ unifyWithOverrideM False MutNone tunit lqt $ mkErrorF n ("Invalid left sequence operand: " ++)
         return $ rebuildE n ch .+ rqt
 
     -- | Check trigger-address pair and unify trigger type and message argument.
@@ -1213,7 +1222,7 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
         let muid  = n @~ isEUID  >>= getUID
             mspan = n @~ isESpan >>= getSpan
         trgtv <- newtv muid mspan
-        void $ unifyBinaryM (ttup [ttrg trgtv, taddr]) trgtv ch n sndError
+        void $ unifyBinaryM MutSub (ttup [ttrg trgtv, taddr]) trgtv ch n sndError
         return $ rebuildE n ch .+ tunit
 
     -- | Unify operand types based on the kind of operator.
@@ -1226,30 +1235,31 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
           unifyv (getQTVarId tvl) $ topen tnum tbot
           tvr <- newtv muid mspan
           unifyv (getQTVarId tvr) $ topen tnum tbot
-          (_, resultqt) <- unifyBinaryM tvl tvr ch n numericError
+          (_, resultqt) <- unifyBinaryM MutNone tvl tvr ch n numericError
           return $ rebuildE n ch .+ resultqt
 
       | comparison op = do
           lqt <- qTypeOfM $ head ch
           rqt <- qTypeOfM $ last ch
           -- TODO: subtype for numeric only
-          void $ unifyWithOverrideM True lqt rqt $ mkErrorF n comparisonError
+          void $ unifyWithOverrideM True MutNone lqt rqt $ mkErrorF n comparisonError
           return $ rebuildE n ch .+ tbool
 
       | logic op = do
-            void $ unifyBinaryM tbool tbool ch n logicError
+            void $ unifyBinaryM MutNone tbool tbool ch n logicError
             return $ rebuildE n ch .+ tbool
 
       | textual op = do
-            void $ unifyBinaryM tstr tstr ch n stringError
+            void $ unifyBinaryM MutNone tstr tstr ch n stringError
             return $ rebuildE n ch .+ tstr
 
       | op == ONeg = do
-            chqt <- unifyUnaryM (topen tnum tbot) ch $ mkErrorF n uminusError
+            chqt <- unifyUnaryM MutNone (topen tnum tbot) ch $
+                      mkErrorF n uminusError
             return $ rebuildE n ch .+ chqt
 
       | op == ONot = do
-            void $ unifyUnaryM tbool ch $ mkErrorF n negateError
+            void $ unifyUnaryM MutNone tbool ch $ mkErrorF n negateError
             return $ rebuildE n ch .+ tbool
 
       | otherwise = left $ "Invalid operation: " ++ show op
@@ -1276,25 +1286,25 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
       -- First child is EType, so skip it
       sqt   <- qTypeOfM $ ch !! 1
       nqt   <- qTypeOfM $ last ch
-      retqt <- unifyWithOverrideM False sqt nqt $ mkErrorF n ("Mismatched case-of branch types: " ++)
+      retqt <- unifyWithOverrideM False MutEq sqt nqt $ mkErrorF n ("Mismatched case-of branch types: " ++)
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EIfThenElse) = do
       pqt   <- qTypeOfM $ head ch
       tqt   <- qTypeOfM $ ch !! 1
       eqt   <- qTypeOfM $ last ch
-      void $ unifyWithOverrideM False pqt tbool $
+      void $ unifyWithOverrideM False MutNone pqt tbool $
                mkErrorF n ("Invalid if-then-else predicate: " ++)
-      retqt <- unifyWithOverrideM False tqt eqt $
+      retqt <- unifyWithOverrideM False MutEq tqt eqt $
                  mkErrorF n ("Mismatched condition branches: " ++)
       return $ rebuildE n ch .+ retqt
 
     inferQType ch n@(tag -> EAddress) = do
       hostqt <- qTypeOfM $ head ch
       portqt <- qTypeOfM $ last ch
-      void $ unifyWithOverrideM False hostqt tstr $
+      void $ unifyWithOverrideM False MutNone hostqt tstr $
         mkErrorF n ("Invalid address host string: " ++)
-      void $ unifyWithOverrideM False portqt tint $ mkErrorF n ("Invalid address port int: " ++)
+      void $ unifyWithOverrideM False MutNone portqt tint $ mkErrorF n ("Invalid address port int: " ++)
       return $ rebuildE n ch .+ taddr
 
     inferQType ch n  = return $ rebuildE n ch
@@ -1303,16 +1313,16 @@ inferExprTypes expr = mapIn1RebuildTree lambdaBinding sidewaysBinding inferQType
 
     rebuildE (Node t _) ch = Node t ch
 
-    unifyBinaryM lexpected rexpected ch n errf = do
+    unifyBinaryM mut lexpected rexpected ch n errf = do
       lqt <- qTypeOfM $ head ch
       rqt <- qTypeOfM $ last ch
-      void $ unifyWithOverrideM True lexpected lqt (mkErrorF n $ errf "left")
-      void $ unifyWithOverrideM True rexpected rqt (mkErrorF n $ errf "right")
+      void $ unifyWithOverrideM True mut lexpected lqt (mkErrorF n $ errf "left")
+      void $ unifyWithOverrideM True mut rexpected rqt (mkErrorF n $ errf "right")
       return (lqt, rqt)
 
-    unifyUnaryM expected ch errf = do
+    unifyUnaryM mut expected ch errf = do
         chqt <- qTypeOfM $ head ch
-        void $ unifyWithOverrideM True chqt expected errf
+        void $ unifyWithOverrideM True mut chqt expected errf
         return chqt
 
     numeric    op = op `elem` [OAdd, OSub, OMul, ODiv, OMod]
