@@ -15,6 +15,8 @@
 --   http://okmij.org/ftp/Computation/FLOLAC/TInfLetP.hs
 --
 
+-- TODO: add mutability annotations to tbvar
+--       deal with mutability outside of unify
 -- TODO: add uids to type variables and print them
 -- TODO: deal with contravariance for functions passed in
 -- TODO: keep most varids one level deep (pointing to another id that has a type) to improve performance
