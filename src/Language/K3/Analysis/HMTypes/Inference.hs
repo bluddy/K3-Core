@@ -139,9 +139,14 @@ type TDVEnv = HashMap Identifier QTVarId
 --   2. map of id to uid
 type TVEnv = (QTVarId, IntMap (UID, Maybe Span))
 
+-- | Mutability modifiers for varids
+data QTMutMod = ModNone | ModMut | ModImmut
+                    deriving (Eq, Read, Show)
+
 -- | A type variable binding environment.
---   1. map of id to type/other id
-type TVBEnv = IntMap (K3 QType)
+--   map of id to 1. type/other id
+--                2. mutability of that type (at the highest level)
+type TVBEnv = IntMap (K3 QType, QTMutMod)
 
 -- | A concretization environment
 --   Shows which types are applied to which other types, which must therefore
@@ -225,12 +230,35 @@ tclext env id' id'' = IntMap.insertWith IntSet.union id' (IntSet.singleton id'')
 tvbenv0 :: TVBEnv
 tvbenv0 = IntMap.empty
 
-tvblkup :: TVBEnv -> QTVarId -> Maybe (K3 QType)
+tvblkup :: TVBEnv -> QTVarId -> Maybe (K3 QType, QTModMut)
 tvblkup env v = IntMap.lookup v env
 
-tvbext :: TVBEnv -> QTVarId -> K3 QType -> TVBEnv
-tvbext env v t = IntMap.insert v t env
+-- Lookup with modifier. Returns only a type
+tvblkup :: TVBEnv -> QTVarId -> Maybe (K3 QType)
+tvblkup' env v =
+  let (qt, mod) = tvblkup env v
+  in modifyMut mod qt
 
+stripMut :: K3 QType -> K3 QType
+stripMut t = (t @- QTMutable) @- QTImmutable
+
+-- Modify a type according to the mutmod
+modifyMut :: QTMutMod -> K3 QType -> K3 QType
+modifyMut ModNone  t = stripMut t
+modifyMut ModMut   t = stripMut t @+ QTMutable
+modifyMut ModImmut t = stripMut t @+ QTImmutable
+
+tvbext :: TVBEnv -> QTVarId -> K3 QType -> QTModMut -> TVBEnv
+tvbext env v t mod = IntMap.insert v t mod env
+
+-- Default: no mutability modifier
+tvbext' :: TVBEnv -> QTVarId -> K3 QType -> TVBEnv
+tvbext' env v t mod = IntMap.insert v t ModNone env
+
+tvbmodmut :: TVBEnv -> QTVarId -> QTModMut -> TVBEnv
+tvbmodmut env v mod = IntMap.adjust doMod v env
+  where
+    doMod (t, _) = (t, mod)
 
 -- TVEnv helpers
 -- Type Variable environment
@@ -327,16 +355,30 @@ tvfree venv benv = filter (not . flip IntMap.member benv) [0..fst venv-1]
 -- `Shallow' substitution
 -- Find a type that's not a variable, or is a free typevar
 tvchase :: TVBEnv -> TVEnv -> K3 QType -> K3 QType
-tvchase tvbe tve (tag -> QTVar v) | Just t <- tvblkup tvbe v = tvchase tvbe tve t
-tvchase _ tve t = tvAddUIDSpan tve t
+tvchase tvbe tve qt = snd $ tvchasev tvbe tve
 
 -- 'Shallow' substitution, additionally returning the last variable in
 --  the chased chain.
 tvchasev :: TVBEnv -> TVEnv -> K3 QType -> (Maybe QTVarId, K3 QType)
-tvchasev tvbe tve t = loop Nothing t
+tvchasev tvbe tve qt = loop Nothing ModNone qt
   where
-    loop _ (tag -> QTVar v) | Just ctv <- tvblkup tvbe v = loop (Just v) ctv
-    loop lastV tv = (lastV, tvAddUIDSpan tve tv)
+    -- We use the first mutation modifier that we see
+    loop _ ModNone (tag -> QTVar v) | (Just t, newmod) <- tvblkup tvbe v = loop (Just v) newmod t
+    loop _ mod     (tag -> QTVar v) | (Just t, _)      <- tvblkup tvbe v = loop (Just v) mod    t
+    loop lastV mod  t = (lastV, tvAddUIDSpan tve $ modifyMut mod t)
+
+-- The occurs check: if v appears in t
+-- First, get the last tvar v points to
+-- Either any of the children of t have this tvar, or a QTVar in t links to this tvar
+occurs :: QTVarId -> K3 QType -> TVBEnv -> Bool
+occurs v t' tvbe = loop t'
+  -- Follow v to the last tvar available
+  where
+    loop t@(tag -> QTOpen)    = any loop $ children t
+    loop t@(tag -> QTConst _) = any loop $ children t
+    loop (tag -> QTVar v2) | v == v2   = True
+                           | otherwise = maybe False (loop . fst) $ tvblkup tvbe v2
+    loop _ = False
 
 -- Compute (quite unoptimally) the characteristic function of the set
 --  forall tvb \in fv(tve_before). Union fv(tvsub(tve_after,tvb))
@@ -353,18 +395,6 @@ varsIn t = runIdentity $ foldMapTree extractVars IntSet.empty t
     extractVars _ (tag -> QTVar v) = return $ IntSet.singleton v
     extractVars chAcc _ = return $ IntSet.unions chAcc
 
--- The occurs check: if v appears in t
--- First, get the last tvar v points to
--- Either any of the children of t have this tvar, or a QTVar in t links to this tvar
-occurs :: QTVarId -> K3 QType -> TVBEnv -> Bool
-occurs v t' tvbe = loop t'
-  -- Follow v to the last tvar available
-  where
-    loop t@(tag -> QTOpen)    = any loop $ children t
-    loop t@(tag -> QTConst _) = any loop $ children t
-    loop (tag -> QTVar v2) | v == v2   = True
-                           | otherwise = maybe False loop $ tvblkup tvbe v2
-    loop _                  = False
 
 
 {- TInfM helpers -}
@@ -413,18 +443,20 @@ tvsub ::  K3 QType -> TInfM (K3 QType)
 tvsub = modifyTree sub
   where
     sub t@(tag -> QTVar id') = do
-      tvbe <- getTVBE
-      case tvblkup tvbe id' of
-        Just t' -> tvsub t' >>= extendAnns t
-        _       -> return t
-
+      env <- get
+      case tvblkup' tvbe id' of
+        Just _ ->
+          -- We need tvchase's mut propagation mechanism
+          let t' = tvchase (tvarBindEnv env) (tvarEnv env) t
+          in tvsub t'
+        _      -> return t
     sub t = return t
 
     -- Add to tdest all the annotations of tsrc
-    extendAnns tsrc' tdest = return $ foldl' (@+) tdest $
-                              annotations tdest `difference` annotations tsrc'
+    --    extendAnns tsrc' tdest = return $ foldl' (@+) tdest $
+    --                          annotations tdest `difference` annotations tsrc'
 
--- | Replace one type with another throughout a tree
+-- | Replace typevars with other typevars throughout a tree
 tvreplace :: IntMap QTVarId -> K3 QType -> K3 QType
 tvreplace dict tree = runIdentity $ modifyTree sub tree
   where
@@ -464,16 +496,16 @@ collectionSubRecord ct@(getQTCollectionIds -> Just annIds)
 collectionSubRecord _ _ = return Nothing
 
 -- Unify a free variable v1 with t2
-unifyv :: QTVarId -> K3 QType -> TInfM ()
-unifyv v1 t@(tag -> QTVar v2)
+unifyv :: QtMutMod -> QTVarId -> K3 QType -> TInfM ()
+unifyv mod v1 t@(tag -> QTVar v2)
   | v1 == v2  = return ()
 
     -- Since they're both variables make one point to the other.
     -- TODO: chasev t before making v1 point to it
-  | otherwise = trace (prettyTaggedSPair "unifyv var" v1 t) $
-      modify $ modTvarBindEnv $ \tvbe -> tvbext tvbe v1 t
+  | otherwise = trace (prettyTaggedSPair ("unifyv var" ++ show mod) v1 t) $
+      modify $ modTvarBindEnv $ \tvbe -> tvbext tvbe v1 mod t
 
-unifyv v t = do
+unifyv mod v t = do
   tvbe <- getTVBE
   tve  <- getTVE
   if occurs v t tvbe
@@ -508,27 +540,20 @@ unifyv v t = do
     retTSelf anns = return $ foldl' (@+) tself anns
 
     addToEnv str t' = trace (prettyTaggedSPair str v t') $
-                       modify $ modTvarBindEnv $ \tvbe' -> tvbext tvbe' v t'
+                       modify $ modTvarBindEnv $ \tvbe' -> tvbext tvbe' v t' mod
 
 -- | Unification driver type synonyms.
 type RecordParts = (K3 QType, QTData, [Identifier])
 type QTypeCtor = [K3 QType] -> K3 QType
-type UnifyPreF  a = K3 QType -> TInfM (a, K3 QType)
-type UnifyPostF a = (a, a) -> K3 QType -> TInfM (K3 QType)
 
 -- | A unification driver, i.e., common unification code for both
 --   our standard unification method, and unification with variable overrides
 --   For 2 lower bound types, we find the lowest
---   doOpen: whether we should get the widest type for open types or not
---           (we don't do it for lambda application)
-unifyDrv :: (Show a) => UnifyPreF a -> UnifyPostF a -> Bool -> QTMutCheck -> K3 QType -> K3 QType -> TInfM (K3 QType)
-unifyDrv preF postF allowSub mutCheck qt1 qt2 = do
-    (p1, qt1') <- preF qt1
-    (p2, qt2') <- preF qt2
-    qt         <- trace (prettyTaggedPair "unifyDrv" qt1' qt2') $
-                    unifyDrv' qt1' qt2'
-    postF (p1, p2) qt
-
+--   allowSub: do we allow subtyping, or must the types by equal
+--   mutCheck: how we should enforce mutability
+unifyDrv :: (Show a) => Bool -> Bool -> K3 QType -> K3 QType -> TInfM (K3 QType)
+unifyDrv allowSub mutCheck qt1 qt2 =
+  trace (prettyTaggedPair "unifyDrv" qt1 qt2) $ unifyDrv' qt1 qt2
   where
     unifyDrv' :: K3 QType -> K3 QType -> TInfM (K3 QType)
 
@@ -635,17 +660,17 @@ unifyDrv preF postF allowSub mutCheck qt1 qt2 = do
     -- recurse unifyDrv
     -- We always recurse with full mutability check
     rcr :: K3 QType -> K3 QType -> TInfM (K3 QType)
-    rcr a b = unifyDrv preF postF allowSub MutEq a b
+    rcr a b = unifyDrv allowSub True a b
 
     -- Join annotations together except for mutability contradiction
+    -- We only check here after recursing -- first layer is checked differently
     unifyAnno :: K3 QType -> K3 QType -> TInfM [Annotation QType]
     unifyAnno sup@(annotations -> annA) sub@(annotations -> annB) =
       let annAB = nub $ annA ++ annB in
       case (sup @~ isQTQualified, sub @~ isQTQualified, mutCheck) of
-        (Just x, Just y, _) | x == y               -> return annAB
-        (Just QTImmutable, Just QTMutable, MutSub) -> return annAB
-        (_, _, MutNone)                            -> return annAB
-        _ -> unifyErr sup sub "mutability-annotations" ""
+        (Just x, Just y, _) | x == y -> return [x]
+        (Just x, Just y, False)      -> return [y]
+        _ -> unifyErr sup sub "deep-mutability-annotations" ""
 
     -- Check if we meet subtyping criteria
     -- subF is the way we check one type is a subtype of the other
@@ -757,15 +782,16 @@ unifyDrv preF postF allowSub mutCheck qt1 qt2 = do
     -- Errors
     primitiveErr a b = unifyErr a b "primitives" ""
 
-    unifyErr a b kind s =
-      left $ unlines [
-        "Unification mismatch on " ++ kind ++ " (" ++ s ++ "):",
-        pretty a,
-        pretty b
-      ]
-
     subSelfErr ct = left $ boxToString $
       "Invalid self substitution, qtype is not a collection: " : prettyLines ct
+
+unifyErr :: K3 QType -> K3 QType -> String -> String -> TInfM ()
+unifyErr a b kind s =
+  left $ unlines [
+    "Unification mismatch on " ++ kind ++ " (" ++ s ++ "):",
+    pretty a,
+    pretty b
+  ]
 
 tvAddUIDSpan :: TVEnv -> K3 QType -> K3 QType
 tvAddUIDSpan tve n@(tag -> QTVar i) =
@@ -780,6 +806,7 @@ tvAddUIDSpan tve n@(tag -> QTVar i) =
 tvAddUIDSpan _ n = n
 
 
+{-
 -- | Type unification.
 -- UnifyDrv with pre-tvchase
 unifyM :: Bool -> K3 QType -> K3 QType -> (String -> String) -> TInfM ()
@@ -791,6 +818,7 @@ unifyM allowSub t1 t2 errf =
           tve  <- getTVE
           return ((), tvchase tvbe tve qt)
         postId _    = return
+-}
 
 -- Mutability modifier for unification
 -- Only lasts one level deep, as any further is always a type error
@@ -798,27 +826,80 @@ data QTMutCheck = MutNone    -- We don't care about mutability
                 | MutSub     -- We care and can subtype
                 | MutEq      -- We care and mutability must be equal
 
+-- Unify mutability annotations on variables
+-- We expect the super, sup, and the original variables (or values)
+unifyMut :: QTMutCheck -> K3 QType -> K3 QType -> K3 QType -> K3 QType -> TInfM ()
+unifyMut checkType super sub origSup origSub = do
+  -- By default, we're immutable
+  tvbe <- getTVBE
+  let mut1 = fromMaybe QTImmutable $ super @~ isQTMutable
+      mut2 = fromMaybe QTImmutable $ sub   @~ isQTMutable
+      mutMod1 = getMod tvbe origSup
+      mutMod2 = getMod tvbe origSub
+      -- If either side is not a varid, the result gets that mutability
+      result' =
+        case (isQTVar origSup, isQTVar origSub) of
+          True, _ -> result @+ mut1
+          _, True -> result @+ mut2
+      tvbe' =
+        case (checkType, mut1, mut2, mutMod1, mutMod2) of
+          -- Subtyping is wrong here: if super is immut, sub can't be mut.
+          -- Try to fix it if we can: look for a 'don't care' varid
+          (MutSub, QTMutable, QTImmutable, a@(Just (i, ModNone)), b) ->
+            modMut a ModImmut $ modMut b ModImmut tvbe
+          (MutSub, QTMutable, QTImmutable, a, b@(Just (i, ModNone))) ->
+            modMut a ModMut   $ modMut b ModMut tvbe
+            $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i ModImmut
+          -- Types need to be equal. Try to fix
+          (MutEq, x, y, Just (i, ModNone), _) | x != y ->
+            modify $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i y
+          (MutEq, x, y, _, Just (i, ModNone)) | x != y ->
+            modify $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i x
+          -- Everything else is fine
+          (_, x, y, _, _) | x == y    -> return ()
+          (MutSub, False, True, _, _) -> return ()
+          (MutNone, _, _, _, _)       -> return ()
+          _ -> unifyErr super sub "Mutability annotations"
+
+  where
+    getMod tvbe (tag -> QTVarId i) = do
+      mod <- liftM snd $ tvblkup tvbe i
+      return (i, mod)
+    getMod _ _ = Nothing
+
+    -- Function to easily modify the mutability annotations
+    modMut (Just (i, _)) mod tvbe' = tvbmodmut tvbe' i mod
+    modMut _ _ tvbe' = tvbe'
+
+
 -- | Type unification with variable overrides to the unification result.
--- TODO: is this necessary?
--- I think it makes the chain shorter
+-- allowSub: allow subtyping. Otherwise types must be =
 unifyWithOverrideM :: Bool -> QTMutCheck -> K3 QType -> K3 QType -> (String -> String) -> TInfM (K3 QType)
 unifyWithOverrideM allowSub mutCheck qt1 qt2 errf = do
-  trace (prettyTaggedPair "unifyOvM" qt1 qt2) $
-    reasonM errf $ unifyDrv preChase postUnify allowSub mutCheck qt1 qt2
-        -- as our first tuple member, return the last variable in the chain
-  where preChase qt = do
-          tvbe <- getTVBE
-          tve  <- getTVE
-          return $ tvchasev tvbe tve qt
+  tvbe <- getTVBE
+  tve  <- getTVE
+  (v1, t1) <- tvchasev tvbe tve qt1
+  (v2, t2) <- tvchasev tvbe tve qt2
+  unifyMut qt1 t1 qt2 t2
 
-        -- take the 'last variables' emitted by unifyDrv
-        postUnify (v1, v2) qt = do
-          tvbe <- getTVBE
-          let vs = catMaybes [v1, v2]
-          -- Check if occurs, if not, point last var at the unified type
-          void $ mapM_ (\v -> unless (occurs v qt tvbe) $ unifyv v qt) vs
-          return $ if null vs then qt
-                   else foldl' (@+) (tvar $ head vs) $ annotations qt
+  -- unification
+  qt <- trace (prettyTaggedPair "unifyOvM" (qt1,t1) (qt2,t2)) $
+    -- Call unifyDrv not testing mutability equality at the high level
+    reasonM errf $ unifyDrv allowSub False t1 t2
+
+  -- modify the variables
+  case (v1, v2) of
+    (Just v, Just v') -> do
+      -- one points to the type, the second points to the first one
+      doUnify v' qt tvbe
+      doUnify v  (tvar v') tvbe
+      return $ tvar v
+    (Just v, _) -> doUnify v qt tvbe >> return $ tvar v
+    (Just _, v) -> doUnify v qt tvbe >> return $ tvar v
+    _           -> return qt
+
+  where
+    doUnify v qt tvbe = unless (occurs v qt tvbe) $ unifyv v qt
 
 
 -- | Given a polytype, for every polymorphic type var, replace all of
