@@ -218,10 +218,6 @@ isQTQualified QTImmutable = True
 isQTQualified QTMutable   = True
 isQTQualified _ = False
 
-isQTMutable :: Annotation QType -> Bool
-isQTMutable QTMutable   = True
-isQTMutable _ = False
-
 isQTUIDSpan :: Annotation QType -> Bool
 isQTUIDSpan (QTSpan _) = True
 isQTUIDSpan (QTUID  _) = True

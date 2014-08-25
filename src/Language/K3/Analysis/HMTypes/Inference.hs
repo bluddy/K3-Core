@@ -15,6 +15,15 @@
 --   http://okmij.org/ftp/Computation/FLOLAC/TInfLetP.hs
 --
 
+-- The current approach is incorrect
+-- Need to keep mut constraints between types so they remain linked.
+  -- What happens when we're connected to an eq mut, and then connect
+  -- to a don't care? If it's the same type, keep the stricter relationship.
+  -- If it's a different type, it can only be widening, and we propagate the stricter relationship.
+  -- Types: immut, mut, any, eq, sub
+--
+--
+-- TODO: add local spans after unifying
 -- TODO: add mutability annotations to tbvar
 --       deal with mutability outside of unify
 -- TODO: add uids to type variables and print them
@@ -139,8 +148,10 @@ type TDVEnv = HashMap Identifier QTVarId
 --   2. map of id to uid
 type TVEnv = (QTVarId, IntMap (UID, Maybe Span))
 
+-- Mutability modifier for unification
+-- Only lasts one level deep, as any further is always a type error
 -- | Mutability modifiers for varids
-data QTMutMod = ModNone | ModMut | ModImmut
+data QTMutMod = ModMut | ModImmut | ModAny | ModEq | ModSub
                     deriving (Eq, Read, Show)
 
 -- | A type variable binding environment.
@@ -244,9 +255,15 @@ stripMut t = (t @- QTMutable) @- QTImmutable
 
 -- Modify a type according to the mutmod
 modifyMut :: QTMutMod -> K3 QType -> K3 QType
-modifyMut ModNone  t = stripMut t
+modifyMut ModAny   t = stripMut t
 modifyMut ModMut   t = stripMut t @+ QTMutable
 modifyMut ModImmut t = stripMut t @+ QTImmutable
+modifyMut ModEq    t = t
+modifyMut ModSub   t = 
+  case t @~ isQTQualified of
+    -- immutable subtypes to any
+    Just QTImmutable -> stripMut t
+    _                -> t
 
 tvbext :: TVBEnv -> QTVarId -> K3 QType -> QTModMut -> TVBEnv
 tvbext env v t mod = IntMap.insert v t mod env
@@ -360,12 +377,22 @@ tvchase tvbe tve qt = snd $ tvchasev tvbe tve
 -- 'Shallow' substitution, additionally returning the last variable in
 --  the chased chain.
 tvchasev :: TVBEnv -> TVEnv -> K3 QType -> (Maybe QTVarId, K3 QType)
-tvchasev tvbe tve qt = loop Nothing ModNone qt
+tvchasev tvbe tve qt = loop Nothing ModEq qt
   where
-    -- We use the first mutation modifier that we see
-    loop _ ModNone (tag -> QTVar v) | (Just t, newmod) <- tvblkup tvbe v = loop (Just v) newmod t
-    loop _ mod     (tag -> QTVar v) | (Just t, _)      <- tvblkup tvbe v = loop (Just v) mod    t
-    loop lastV mod  t = (lastV, tvAddUIDSpan tve $ modifyMut mod t)
+    loop _ mod (tag -> QTVar v) | (Just t, mod') <- tvblkup tvbe v =
+      loop (Just v) (combo mod mod') t
+
+    loop lastV mod t = (lastV, tvAddUIDSpan tve $ modifyMut mod t)
+
+    -- combine the old mod and the new one
+    combo ModEq mod = mod
+    -- subtype of immut allows for any
+    combo ModSub ModImmut = ModAny
+    combo ModSub ModAny   = ModAny
+    combo ModSub ModMut   = ModMut
+    combo ModSub _        = ModSub
+    -- anything else sticks
+    combo mod    _        = mod
 
 -- The occurs check: if v appears in t
 -- First, get the last tvar v points to
@@ -447,8 +474,12 @@ tvsub = modifyTree sub
       case tvblkup' tvbe id' of
         Just _ ->
           -- We need tvchase's mut propagation mechanism
-          let t' = tvchase (tvarBindEnv env) (tvarEnv env) t
-          in tvsub t'
+          let t' = tvchase (tvarBindEnv env) (tvarEnv env) t in
+          case t' @~ isQTQualified of
+            -- Default: if we still have an Any, make type immutable
+            Nothing -> tvsub (t' @~ QTImmutable)
+            _       -> tvsub t'
+
         _      -> return t
     sub t = return t
 
@@ -551,6 +582,7 @@ type QTypeCtor = [K3 QType] -> K3 QType
 --   For 2 lower bound types, we find the lowest
 --   allowSub: do we allow subtyping, or must the types by equal
 --   mutCheck: how we should enforce mutability
+--   TODO: need to be able to recurse with tvchase
 unifyDrv :: (Show a) => Bool -> Bool -> K3 QType -> K3 QType -> TInfM (K3 QType)
 unifyDrv allowSub mutCheck qt1 qt2 =
   trace (prettyTaggedPair "unifyDrv" qt1 qt2) $ unifyDrv' qt1 qt2
@@ -669,7 +701,8 @@ unifyDrv allowSub mutCheck qt1 qt2 =
       let annAB = nub $ annA ++ annB in
       case (sup @~ isQTQualified, sub @~ isQTQualified, mutCheck) of
         (Just x, Just y, _) | x == y -> return [x]
-        (Just x, Just y, False)      -> return [y]
+        -- No mutability at highest level. That's added by mutability unification
+        (Just x, Just y, False)      -> return []
         _ -> unifyErr sup sub "deep-mutability-annotations" ""
 
     -- Check if we meet subtyping criteria
@@ -756,8 +789,6 @@ unifyDrv allowSub mutCheck qt1 qt2 =
 
     onOpenRecord x y = error $ "OnOpenRecord: expected records but got ["++show x++"]["++show y++"]"
 
-    -- TODO: widen the original varids
-
     -- If types are equal, recurse unify on their children
     onChildren :: QTData -> QTData -> String -> [K3 QType] -> [K3 QType] -> QTypeCtor -> TInfM (K3 QType)
     onChildren tga tgb kind a b ctor
@@ -805,72 +836,47 @@ tvAddUIDSpan tve n@(tag -> QTVar i) =
 
 tvAddUIDSpan _ n = n
 
-
-{-
--- | Type unification.
--- UnifyDrv with pre-tvchase
-unifyM :: Bool -> K3 QType -> K3 QType -> (String -> String) -> TInfM ()
-unifyM allowSub t1 t2 errf =
-  trace (prettyTaggedPair "unifyM" t1 t2) $
-    reasonM errf $ void $ unifyDrv preChase postId allowSub t1 t2
-  where preChase qt = do
-          tvbe <- getTVBE
-          tve  <- getTVE
-          return ((), tvchase tvbe tve qt)
-        postId _    = return
--}
-
--- Mutability modifier for unification
--- Only lasts one level deep, as any further is always a type error
-data QTMutCheck = MutNone    -- We don't care about mutability
-                | MutSub     -- We care and can subtype
-                | MutEq      -- We care and mutability must be equal
-
 -- Unify mutability annotations on variables
--- We expect the super, sup, and the original variables (or values)
+-- We expect the super, sub, the original types, and the unified result
+-- Super and sub have been tvchased
 unifyMut :: QTMutCheck -> K3 QType -> K3 QType -> K3 QType -> K3 QType -> TInfM ()
-unifyMut checkType super sub origSup origSub = do
-  -- By default, we're immutable
+unifyMut checkType (origSup, sup, vsup) (origSub, sub, vsub) result = do
   tvbe <- getTVBE
-  let mut1 = fromMaybe QTImmutable $ super @~ isQTMutable
-      mut2 = fromMaybe QTImmutable $ sub   @~ isQTMutable
-      mutMod1 = getMod tvbe origSup
-      mutMod2 = getMod tvbe origSub
-      -- If either side is not a varid, the result gets that mutability
-      result' =
-        case (isQTVar origSup, isQTVar origSub) of
-          True, _ -> result @+ mut1
-          _, True -> result @+ mut2
-      tvbe' =
-        case (checkType, mut1, mut2, mutMod1, mutMod2) of
-          -- Subtyping is wrong here: if super is immut, sub can't be mut.
-          -- Try to fix it if we can: look for a 'don't care' varid
-          (MutSub, QTMutable, QTImmutable, a@(Just (i, ModNone)), b) ->
-            modMut a ModImmut $ modMut b ModImmut tvbe
-          (MutSub, QTMutable, QTImmutable, a, b@(Just (i, ModNone))) ->
-            modMut a ModMut   $ modMut b ModMut tvbe
-            $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i ModImmut
-          -- Types need to be equal. Try to fix
-          (MutEq, x, y, Just (i, ModNone), _) | x != y ->
-            modify $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i y
-          (MutEq, x, y, _, Just (i, ModNone)) | x != y ->
-            modify $ modTvarBindEnv $ \tvbe -> tvbmodmut tvbe i x
-          -- Everything else is fine
-          (_, x, y, _, _) | x == y    -> return ()
-          (MutSub, False, True, _, _) -> return ()
-          (MutNone, _, _, _, _)       -> return ()
-          _ -> unifyErr super sub "Mutability annotations"
+  let (mut1, mut2) = (super @~ isQTQualified, sub @~ isQTQualified)
+  -- check constraints and modify if needed
+  constrain mut1 mut2 
+      -- connect the two results as needed
+      connect 
 
   where
+    -- Constrain the mutability according to our checkType guidelines
+    constrain mut1 mut2 = case (checkType, mut1, mut2) of
+      -- If mutable is the super, the sub must be restricted to mutable
+      (MutSub, Just QTMutable, Nothing)   -> modMut origSub ModMut tvbe
+      -- If immutable is the sub, the super must be restricted
+      (MutSub, Nothing, Just QTImmutable) -> modMut origSup ModImmut tvbe
+      -- Restrict any types to specific ones under equals
+      (MutEq, Nothing, Just QTImmutable)  -> modMut origSup ModImmut tvbe
+      (MutEq, Nothing,  Just QTMutable)   -> modMut origSup ModMut tvbe
+      (MutEq, Just QTImmutable, Nothing)  -> modMut origSub ModImmut tvbe
+      (MutEq, Just QTMutable, Nothing)    -> modMut origSub ModMut tvbe
+      -- Wrong cases
+      (MutEq, x, y) | x != y -> unifyErr super sub "Mutability annotations not equal"
+      (MutSub, QTMutable, QTImmutable) -> unifyErr super sub "Mutability annotations don't subtype"
+      -- Everything else is fine
+      _ -> return tbve
+
     getMod tvbe (tag -> QTVarId i) = do
       mod <- liftM snd $ tvblkup tvbe i
       return (i, mod)
     getMod _ _ = Nothing
 
-    -- Function to easily modify the mutability annotations
+    -- Modify the mutability of a tvar. We change the graph layout to match
     modMut (Just (i, _)) mod tvbe' = tvbmodmut tvbe' i mod
     modMut _ _ tvbe' = tvbe'
 
+qtmodmut QTImmutable = ModImmut
+qtmodmut QTMutable   = ModMut
 
 -- | Type unification with variable overrides to the unification result.
 -- allowSub: allow subtyping. Otherwise types must be =
@@ -880,12 +886,38 @@ unifyWithOverrideM allowSub mutCheck qt1 qt2 errf = do
   tve  <- getTVE
   (v1, t1) <- tvchasev tvbe tve qt1
   (v2, t2) <- tvchasev tvbe tve qt2
-  unifyMut qt1 t1 qt2 t2
 
   -- unification
   qt <- trace (prettyTaggedPair "unifyOvM" (qt1,t1) (qt2,t2)) $
     -- Call unifyDrv not testing mutability equality at the high level
     reasonM errf $ unifyDrv allowSub False t1 t2
+
+  -- handle mutability modifications for `any' types
+  unifyMut mutCheck (qt1, t1, v1) (qt2, t2, v2) qt
+
+  -- Connect the super to the result
+  -- TODO: check that we're not widening the mutability
+  case (mutCheck, v1, mutStatus t1, v2, mutStatus t2) of
+    -- In this case, we need to make independent links to the type
+    -- Using the old mutability
+    (MutNone, _, m1, _, m2) -> do
+      tv <- newtv qt Nothing
+      connect tv qt MutEq
+      connect v1 (tvar tv) m1
+      connect v2 (tvar tv) m2
+    -- Both Eq and Sub
+    (mut, Just _, m1, Just _, m2) -> do
+      connect v1 qt m1
+      connect v2 (tvar v1) mut
+    (mut, Just _, m1, Nothing, M2) -> do
+      connect v1 qt m1
+    (mut, Nothing, m1, Just _, m2) -> do
+      connect v2 qt m2
+
+  connect v qt qt
+  -- TODO: only connect if it's an upgrade in terms of mutability
+  -- otherwise, create a 
+  -- Connect the variables to the type
 
   -- modify the variables
   case (v1, v2) of
@@ -899,7 +931,11 @@ unifyWithOverrideM allowSub mutCheck qt1 qt2 errf = do
     _           -> return qt
 
   where
+    -- TODO: error out on occurs check
     doUnify v qt tvbe = unless (occurs v qt tvbe) $ unifyv v qt
+
+    connect v t result =
+      if 
 
 
 -- | Given a polytype, for every polymorphic type var, replace all of
